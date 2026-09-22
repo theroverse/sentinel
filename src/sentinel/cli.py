@@ -48,6 +48,13 @@ COMANDOS
     kill <PID>           Encerra um processo problema com protecao de
                          lista do sistema + confirmacao. --tree inclui
                          descendentes.
+    orders               O que o Sentinel pode fazer sem pedir, e o modo
+                         sombra: `orders shadow --on|--off` decide se o
+                         degrau 1 age ou so grava o que faria.
+    relief <PID>         Rebaixa (ou devolve, com --restore) a prioridade de
+                         um processo, agora, porque VOCE pediu — sem as
+                         guardas de autonomia. Use numa janela elevada para
+                         um processo que o daemon nao alcanca.
     prune                Apaga eventos antigos (--older-than DIAS).
     config               Mostra limiares ativos e caminhos (--show-source).
 
@@ -128,6 +135,12 @@ def build_parser() -> argparse.ArgumentParser:
     events_p.add_argument(
         "--json", action="store_true", help="Saida JSON crua (uma linha por evento)."
     )
+    events_p.add_argument(
+        "--interventions",
+        action="store_true",
+        help="Em vez das anomalias, o que o Sentinel fez por conta propria "
+        "(o historico do degrau 1: aplicado, recusado ou so sombra).",
+    )
 
     fix_p = sub.add_parser("fix", help="Tutorial de correcao guiado.")
     fix_p.add_argument(
@@ -166,6 +179,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--tree",
         action="store_true",
         help="Inclui processos descendentes na arvore a encerrar.",
+    )
+
+    relief_p = sub.add_parser(
+        "relief",
+        help="Rebaixar/devolver a prioridade de um processo, por pedido explicito.",
+    )
+    relief_p.add_argument("pid", type=int, help="PID do processo alvo.")
+    relief_p.add_argument(
+        "--restore",
+        action="store_true",
+        help="Devolve o valor que o processo tinha antes da ultima intervencao "
+        "do Sentinel, em vez de rebaixar.",
+    )
+
+    orders_p = sub.add_parser(
+        "orders",
+        help="O que o Sentinel faz sem pedir (degraus ligados, guardas, modo sombra).",
+    )
+    orders_sub = orders_p.add_subparsers(dest="orders_command")
+    shadow_p = orders_sub.add_parser(
+        "shadow", help="Modo sombra: decide e grava, sem tocar em processo nenhum."
+    )
+    shadow_g = shadow_p.add_mutually_exclusive_group()
+    shadow_g.add_argument(
+        "--on", action="store_true", dest="on", help="Liga o modo sombra."
+    )
+    shadow_g.add_argument(
+        "--off", action="store_true", dest="off", help="Desliga (o padrao: age)."
     )
 
     prune_p = sub.add_parser("prune", help="Apaga eventos antigos.")
@@ -229,6 +270,7 @@ def cmd_status(paths: settings.Paths, args: argparse.Namespace) -> int:
             print("Daemon: parado")
 
     _print_pause_state(paths, st.paused)
+    _print_shadow_state(paths)
 
     store = _store(paths)
     opens = store.open_anomalies()
@@ -247,6 +289,21 @@ def _print_pause_state(paths: settings.Paths, paused: bool) -> None:
     print(
         f"Vigilancia automatica: PAUSADA{note} — nada novo e registrado; "
         "retome com 'sentinel resume'"
+    )
+
+
+def _print_shadow_state(paths: settings.Paths) -> None:
+    """So quando esta ligado: DESLIGADO e o estado padrao, e uma linha por
+    nada mudado seria o log dizendo 'mudei o comportamento' sem mudança."""
+    from sentinel import orders as orders_mod
+
+    if not orders_mod.load(paths).shadow:
+        return
+    decided = len(_store(paths).interventions())
+    note = f" ({decided} decisoes no historico)" if decided else ""
+    print(
+        "Acoes automaticas: MODO SOMBRA — o Sentinel decide e grava o que "
+        "faria, sem tocar em processo nenhum" + note
     )
 
 
@@ -280,11 +337,16 @@ def cmd_resume(paths: settings.Paths, args: argparse.Namespace) -> int:
 def cmd_watch(paths: settings.Paths, args: argparse.Namespace) -> int:
     sensor = Sensor()
     stop_after = 1 if args.once else None
+    # `--once` e diagnostico, e um tick avulso nao pode sair rebaixando apps
+    # enquanto o daemon faz o mesmo: com um tick so, o degrau fica desligado
+    # e dito — vigia quem quiser, age quem fica.
+    relief = None if args.once else daemon.build_relief_agent(paths)
     ticks = daemon.run_watch_loop(
         paths,
         sensor=sensor,
         store=_store(paths),
         incident_sources=daemon.build_incident_sources(),
+        relief=relief,
         stop_after=stop_after,
     )
     if not args.quiet:
@@ -320,6 +382,20 @@ def _event_line(event: dict) -> str:
 
 def cmd_events(paths: settings.Paths, args: argparse.Namespace) -> int:
     store = _store(paths)
+    if args.interventions:
+        rows = store.interventions()
+        events = rows[-args.limit :] if args.limit else rows
+        if args.json:
+            for event in events:
+                print(json.dumps(event, ensure_ascii=False))
+            return 0
+        if not events:
+            print("Nenhuma intervencao registrada.")
+            return 0
+        for event in events:
+            print(_intervention_line(event))
+        return 0
+
     events = store.anomalies()
     if args.open_only:
         events = [e for e in events if e.get("status", "open") == "open"]
@@ -337,6 +413,20 @@ def cmd_events(paths: settings.Paths, args: argparse.Namespace) -> int:
     for event in events:
         print(_event_line(event))
     return 0
+
+
+def _intervention_line(event: dict) -> str:
+    """Uma linha do que o Sentinel fez, nao do que ele viu.
+
+    Sem `severity` nem `status`, porque nao e anomalia: o que importa aqui e
+    quem recebeu a intervencao, se ela foi aplicada, e o motivo quando nao
+    foi.
+    """
+    ts = str(event.get("ts", ""))[:19]
+    detail = event.get("detail") or {}
+    mark = " [sombra]" if detail.get("shadow") else ""
+    metric = str(event.get("metric", "?"))
+    return f"{ts}  {metric:<24} {event.get('label', '')}{mark}  id={event.get('id')}"
 
 
 def _kbstore(paths: settings.Paths):
@@ -511,6 +601,176 @@ def cmd_kill(paths: settings.Paths, args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_relief(paths: settings.Paths, args: argparse.Namespace) -> int:
+    """O degrau 1 na mao de alguem, e a saida prevista pro processo que o
+    daemon nao alcanca porque pertence a outra sessao (spec 5).
+
+    Sem as guardas de autonomia — teto por hora e cooldown existem pra conter
+    uma decisao que ninguem revisa, e aqui a revisao foi digitar o comando.
+    """
+    from sentinel import relief as relief_mod
+
+    agent = daemon.build_relief_agent(paths)
+    if agent is None:
+        print(
+            "[SEM ALAVANCA] sem psutil nao ha como mexer na prioridade de nada. "
+            "Instale-o (pip install psutil) e rode de novo."
+        )
+        return 1
+
+    store = _store(paths)
+    if args.restore:
+        result = agent.restore_manual(args.pid, _previous_priority(store, args.pid))
+    else:
+        result = agent.apply_manual(args.pid)
+
+    event = store.record_intervention(result)
+    if result.applied:
+        if args.restore:
+            print(
+                f"[DEVOLVIDO] {result.name} (pid {result.pid}): "
+                f"prioridade {result.from_level} -> {result.to_level}"
+            )
+        else:
+            print(
+                f"[REBAIXADO] {result.name} (pid {result.pid}): "
+                f"{result.from_level} -> {result.to_level}"
+            )
+            print(
+                f"            Devolver: python sentinel.py relief "
+                f"{result.pid} --restore"
+            )
+        print(f"            Registrado como id={event.get('id')} em {paths.events}")
+        return 0
+
+    return _relief_refusal(result, args)
+
+
+def _previous_priority(store: EventStore, pid: int):
+    """O valor que o processo tinha antes da ultima intervencao APLICADA do
+    Sentinel nele.
+
+    Le do `events.jsonl`, nao do journal do daemon: os dois processos
+    escrevendo o mesmo journal fariam um dos dois perder historico, e o
+    evento ja carrega o numero cru (`detail.priority.from_raw`) pra isso.
+    """
+    from sentinel.relief import ACTION_LOWER
+
+    for event in reversed(store.interventions()):
+        detail = event.get("detail") or {}
+        target = detail.get("target") or {}
+        if target.get("pid") != pid:
+            continue
+        if detail.get("action") != ACTION_LOWER or not event.get("applied"):
+            continue
+        return (detail.get("priority") or {}).get("from_raw")
+    return None
+
+
+def _relief_refusal(result, args: argparse.Namespace) -> int:
+    """Por que nao, dito com a palavra que decide o proximo passo.
+
+    O caso que importa e o `sem-alcance`: a interface declara o limite em vez
+    de fingir que tentou, e oferece o caminho (janela elevada). Sem prompt,
+    sem fallback silencioso.
+    """
+    from sentinel import relief as relief_mod
+
+    reason = result.reason
+    if reason == relief_mod.SKIP_DENIED:
+        print(
+            f"[NAO ALCANCADO] o pid {args.pid} pertence a outra sessao (elevada "
+            "ou de outro usuario); o Sentinel nao o alcanca sem admin."
+        )
+        print(
+            "                Rode o MESMO comando numa janela elevada — e o "
+            "caminho previsto, nao uma gambiarra."
+        )
+    elif reason == relief_mod.SKIP_PROTECTED:
+        print(
+            f"[RECUSADO] {result.name} esta na lista do sistema: o Sentinel nao "
+            "mexe em servico do Windows nem em si mesmo, nem por pedido."
+        )
+    elif reason == relief_mod.SKIP_GONE:
+        print(f"[NAO ENCONTRADO] nao ha processo vivo com o pid {args.pid}.")
+    elif reason == relief_mod.SKIP_NO_PREVIOUS:
+        print(
+            f"[SEM VALOR ANTERIOR] o historico nao registra intervencao do "
+            f"Sentinel no pid {args.pid}, entao nao ha para onde devolver."
+        )
+        print(
+            "                     Chutar 'normal' poderia SUBIR a prioridade de "
+            "algo que ja estava rebaixado; escolha voce, no Gerenciador de Tarefas."
+        )
+    elif reason == relief_mod.SKIP_NO_ACTUATOR:
+        print("[SEM ALAVANCA] o psutil sumiu do caminho no meio da execucao.")
+    elif reason == relief_mod.NOTHING:
+        print(
+            f"[JA ESTAVA ASSIM] {result.name} (pid {result.pid}) ja estava em "
+            f"{result.to_level}."
+        )
+        return 0
+    else:
+        print(f"[{reason}] {result.label()}")
+    return 1
+
+
+def cmd_orders(paths: settings.Paths, args: argparse.Namespace) -> int:
+    from sentinel import orders as orders_mod
+
+    if getattr(args, "orders_command", None) == "shadow" and (args.on or args.off):
+        orders_mod.save(paths, orders_mod.Orders(shadow=args.on))
+        if args.on:
+            print("Modo sombra: LIGADO.")
+            print(
+                "  O Sentinel segue decidindo e gravando cada decisao como"
+                " `SERIA ...` (`shadow: true`, `applied: false`), sem tocar em"
+                " processo nenhum."
+            )
+            print(
+                "  O que ja foi rebaixado continua sendo devolvido no fim do "
+                "episodio: sombra segura o proximo passo, nao desfaz o ultimo."
+            )
+        else:
+            print("Modo sombra: DESLIGADO — o degrau 1 volta a agir no proximo ciclo.")
+        print(f"Arquivo: {paths.orders}")
+        return 0
+
+    _print_orders(paths)
+    return 0
+
+
+def _print_orders(paths: settings.Paths) -> None:
+    from sentinel import orders as orders_mod
+
+    state = orders_mod.load(paths)
+    overrides = settings.load_overrides(paths)
+    hour = settings.threshold(
+        "RELIEF_HOUR_LIMIT", overrides, float(settings.RELIEF_HOUR_LIMIT)
+    )
+    cooldown = settings.threshold(
+        "RELIEF_APP_COOLDOWN_S", overrides, float(settings.RELIEF_APP_COOLDOWN_S)
+    )
+    shadow = (
+        "LIGADO — decide e grava, nao toca em nada"
+        if state.shadow
+        else "DESLIGADO — o degrau 1 age"
+    )
+    print("O que o Sentinel faz sem pedir:")
+    print("  degrau 1  rebaixar prioridade em estagnacao .. LIGADO (desde o inicio)")
+    print("  degrau 2  teto de CPU por job ................ exige ordem por app (fase E)")
+    print("  degrau 3  encerrar arvore .................... exige ordem por app (fase E)")
+    print("  teto de RAM ................................. nunca automatico; so no tutorial")
+    print(f"  modo sombra ................................ {shadow}")
+    print(
+        f"  guardas ...................................... {hour:.0f} intervencoes/hora, "
+        f"cooldown de {cooldown:.0f} s por app"
+    )
+    print("  elevacao .................................... nenhuma, em nenhum caminho")
+    print(f"\nArquivo: {paths.orders}")
+    print("Mudar o modo sombra: python sentinel.py orders shadow --on|--off")
+
+
 def cmd_prune(paths: settings.Paths, args: argparse.Namespace) -> int:
     store = _store(paths)
     dropped = store.prune(older_than_days=args.days)
@@ -558,6 +818,10 @@ def cmd_daemon_run(paths: settings.Paths, args: argparse.Namespace) -> int:
         sensor=Sensor(),
         store=_store(paths),
         incident_sources=daemon.build_incident_sources(),
+        # O daemon e o unico que age: `build_relief_agent` devolve None quando
+        # o ambiente nao permite (sem psutil), e ai o Sentinel vira so
+        # registro — vigilancia que nao derruba o resto por um degrau ausente.
+        relief=daemon.build_relief_agent(paths),
     )
     return 0
 
@@ -574,6 +838,8 @@ _COMMANDS = {
     "kb": cmd_kb,
     "model": cmd_model,
     "kill": cmd_kill,
+    "relief": cmd_relief,
+    "orders": cmd_orders,
     "prune": cmd_prune,
     "config": cmd_config,
     "__daemon-run": cmd_daemon_run,

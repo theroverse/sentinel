@@ -136,6 +136,48 @@ Guardas do caminho autônomo:
   `events.jsonl` e uma resolução automática do tipo `action=...` — o
   histórico é auditável, que é o que permite confiar no degrau 3 depois.
 
+### O que a D2 entregou (2026-09-22)
+
+Deste ponto em diante esta seção descreve o que existe, não o que foi pedido.
+
+- **degrau 1 ligado no loop**: `relief.ReliefAgent` é consultado a cada
+  batimento por `run_watch_loop(..., relief=)`, com o culpado do índice e o
+  estado do episódio (`episode_open`, `suspect`) na mão. Quem não passa por
+  ele é o `watch --once`, desligado de propósito: um tick de diagnóstico não
+  pode correr na frente do daemon nem brigar pelo mesmo pid.
+- **só prioridade, por enquanto**: `ACTION_LOWER` / `ACTION_RESTORE` usam a
+  classe de prioridade do psutil (`BELOW_NORMAL_PRIORITY_CLASS`, lida por
+  `getattr` — nunca número inventado), com queda para `nice` em POSIX.
+  afinidade e teto de I-O continuam teoria: sem evidência medida de que
+  precisam, virar alavanca seria alcance sem motivo.
+- **reversão em três caminhos**: fim do episódio, `shut_down()` no `finally`
+  do loop, e `recover()` no primeiro tick de um daemon novo. O diário
+  `.sentinel/relief.json` guarda pid, nome, `create_time` e os dois valores
+  crus; pid reciclado **não** é devolvido — a identidade confere ou a ação não
+  acontece.
+- **guardas**: teto de `RELIEF_HOUR_LIMIT` (3) decisões/hora e cooldown de
+  `RELIEF_APP_COOLDOWN_S` (600 s) por **nome**. Contam decisões, não toques
+  bem-sucedidos (também as do modo sombra); o boost do próprio daemon não
+  conta, porque contar contra si mesmo desligaria o degrau justo na hora em
+  que ele serve. `paused` não consulta o agente.
+- **modo sombra**: `orders.json` (`{"schema":1,"shadow":bool}`), lido de novo
+  a cada decisão, reescalado por `sentinel orders shadow --on|--off`. A linha
+  do evento não usa a palavra `would_act`: ela carrega `shadow: true` +
+  `applied: false` e um `label` com verbo explícito (`FEZ` / `SERIA` / `NAO
+  FEZ`), porque um campo booleano separado é o que a GUI e o `events
+  --interventions` conseguem filtrar sem parser de texto.
+- **o que mudou do texto acima**: não há "resolução automática" `action=...`.
+  Intervenção é um `kind` próprio (`intervention`), **nunca deduplicado** e
+  nunca fechado sozinho: aplicar marca a anomalia do episódio como
+  `addressing`, e quem diz `resolved` continua sendo o usuário no ciclo do
+  `fix`. Misturar as duas coisas no `kind: "resolution"` faria o Sentinel
+  validar a própria ação.
+- **sem elevação, confirmado em código**: `AccessDenied` termina em
+  `sem-alcance` registrado; não há `runas`, não há serviço, não há segunda
+  tentativa.
+- **fora do que foi entregue**: degraus 2 e 3, ordem permanente por app,
+  qualquer UI (a chave vive no CLI e no `orders.json` até a GUI).
+
 ### Alcance sem elevação
 
 Decisão de 2026-09-22: **o Sentinel roda inteiro como usuário comum** —
@@ -384,36 +426,45 @@ vigilância.
 ## 11. Impacto no que já existe
 
 - **CLI**: entregue — `pause` / `resume`, `kb [--json]`, `model status
-  [--json]`, `fix --explain-source`. Pendente — `orders list|grant|revoke|shadow`
-  e `relief <pid> [--restore]` (fases D/E), e os `--json` da fase 0 da spec da
-  GUI. Fora de escopo — `sentinel tray` (a bandeja saiu, seção 13.1) e
-  `sentinel model setup` (o provisionamento saiu, seção 10).
+  [--json]`, `fix --explain-source`, `relief <pid> [--restore]`, `orders
+  [shadow --on|--off]`, `events --interventions`. Pendente — `orders
+  list|grant|revoke` por app (fase E) e os `--json` da fase 0 da spec da GUI.
+  Fora de escopo — `sentinel tray` (a bandeja saiu, seção 13.1) e `sentinel
+  model setup` (o provisionamento saiu, seção 10).
 - **daemon**: árvore por ciclo, índice de stall, executor de degraus,
   leitura do `paused`, prioridade própria alta. Roda como usuário comum.
-  Estado: `paused` lido (fase C) e índice de stall medindo, com intervalo
-  próprio encurtado sob suspeita (D1). Faltam o executor de degraus e o
-  auto-boost de prioridade (D2).
+  Estado: `paused` lido (fase C), índice de stall medindo com intervalo
+  próprio encurtado sob suspeita (D1), e o **degrau 1 executando** com
+  guardas, diário, reversão e auto-boost de prioridade (D2). Os degraus 2 e 3
+  continuam sem executor: exigem ordem por app.
 - **`SentinelHost.ps1`**: o prompt `YesNo` de reabrir como administrador
   (linhas 130–146) sai. Fica a detecção de `IsAdmin`, só que reorientada:
   ela alimenta a declaração de alcance da seção 5, não um convite à
   elevação. A bandeja (`SentinelTray.ps1`) nasce sem qualquer
   `-Verb RunAs`.
-- **events**: tipos novos (`app_failure`, `orphan_tree`, `stall`,
-  `relief_applied`), schema 2. A linha de incidente **não** tem
+- **events**: tipos novos de métrica (`app_failure`, `orphan_tree`, `stall`),
+  schema 2, e um `kind` novo: `intervention`. A linha de incidente **não** tem
   `value`/`threshold`: tem `label` (uma frase, pro log e pro CLI) e
   `detail` (o mapa da árvore, o módulo + código de exceção da queda, ou os
   números medidos pelo índice de stall). Nem uma nem outra se disfarçam de
-  limiar com zero preenchido.
+  limiar com zero preenchido. A de intervenção carrega `action`, `reason`,
+  `shadow`, `applied`, `ref` e os dois valores crus de prioridade — e não é
+  deduplicada: caderno de conduta não se resume em `occurrences`.
 - **daemon.log**: linha `ANOMALIA <metric> <sev> occ=N status=... id=... ::
   <label>` — o `:: <label>` no fim mantém os pares `chave=valor`
-  interpretáveis e ainda dá de ler o que aconteceu sem abrir o JSONL.
+  interpretáveis e ainda dá de ler o que aconteceu sem abrir o JSONL. O
+  degrau 1 acrescenta `ALIVIO <label> id=...`, com o verbo do resultado
+  (`FEZ` / `SERIA` / `NAO FEZ`) já dentro do `<label>`.
 - **GUI** (fase 1 já aprovada): vista "Ações automáticas" com as ordens
   permanentes, a chave de modo sombra e o histórico do que foi feito sem
   pedir; o card do tutorial passa a mostrar `why`/`prova`/`risco`; um
   processo elevado inalcançável aparece com o limite declarado, não com um
   botão morto.
 - **testes**: fake de `winreg`/ctypes para os degraus; o stall index e o
-  ranking da base são testáveis sem Windows real, como o resto já é.
+  ranking da base são testáveis sem Windows real, como o resto já é. O
+  degrau 1 é testado contra um `psutil` de mentira que expõe as classes de
+  prioridade e levanta `AccessDenied` quando o teste manda — nenhum teste
+  toca pid real, e o relógio das guardas é injetado.
 
 ## 12. Ordem de execução proposta
 
@@ -422,7 +473,7 @@ vigilância.
 | A | ✔ falha de app + órfão + schema 2 + testes | nenhum (só lê) |
 | B | ✔ `kb.db`, formato assertivo, reescrita do conteúdo, ranking | nenhum |
 | C | ✔ pause/resume em arquivo (a bandeja e o toast saíram — 13.1) | baixo |
-| D | **D1 entregue** (2026-09-22): índice de stall medindo no daemon — auto-inanição, thrash e disco saturado, combinados com culpado em crítico sustentado; evento próprio `stall` com os números medidos; intervalo encurtado 2,0 s → 0,5 s sob suspeita; `swap_percent`/`swap_activity_ps` na `Sample` e no batimento; catálogo curado da métrica (3 opções, nenhuma com `action`) com a prova montada só com o que o episódio mediu, e o `culprit` como assinatura de causa na camada 2 da base. **Resta D2**: degrau 1 **já ligado** + guardas (rate limit, cooldown, `paused`) + chave de modo sombra | médio |
+| D | **entregue** (2026-09-22). *D1 — medir:* índice de stall no daemon (auto-inanição, thrash e disco saturado, combinados com culpado em crítico sustentado); evento próprio `stall` com os números medidos; intervalo encurtado 2,0 s → 0,5 s sob suspeita; `swap_percent`/`swap_activity_ps` na `Sample` e no batimento; catálogo curado da métrica (3 opções, nenhuma com `action`) com a prova montada só com o que o episódio mediu, e o `culprit` como assinatura de causa na camada 2 da base. *D2 — agir:* `relief.py` rebaixa o culpado nomeado (classe de prioridade, `nice` onde não há classe), com guardas (`RELIEF_HOUR_LIMIT` 3/h, cooldown 600 s por nome, `paused` mudo, protegidos e auto-recusa, `AccessDenied` declarado e não furado), diário `.sentinel/relief.json` com `create_time` pra provar identidade, reversão em três caminhos (fim do episódio, `finally` do loop, `recover()` do daemon novo), boost do próprio daemon rebaixado, `orders.json` + `sentinel orders shadow --on\|--off` (decide e grava `SERIA` sem tocar), evento `kind: intervention` nunca deduplicado apontando `ref` pro episódio, `sentinel relief <pid> [--restore]` e `events --interventions`. Degraus 2 e 3 seguem sem executor: fase E, com a sua revisão | médio |
 | E | degraus 2 e 3, ordens permanentes por crachá, teto por job | **alto — precisa da sua revisão das guardas** |
 | F | ✔ `local_model.py` (sonda + dois dialetos, veto de loopback) e `model status`; o `setup` saiu (13.1). Restam as vistas novas da GUI | baixo (nenhuma instalação, nenhuma inferência no daemon) |
 

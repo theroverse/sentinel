@@ -741,7 +741,7 @@ function viewProcessos(host) {
 function viewLog(host) {
   host.innerHTML = '<div class="view"><div class="view-head"><div>' +
     '<h1 class="view-title">Log do daemon</h1>' +
-    '<p class="view-sub">Fio de <span class="inline-code">.sentinel/daemon.log</span>: um <span class="inline-code">tick</span> a cada 2 s e uma linha <span class="inline-code">ANOMALIA</span> quando o detector dispara.</p></div>' +
+    '<p class="view-sub">Fio de <span class="inline-code">.sentinel/daemon.log</span>: um <span class="inline-code">tick</span> a cada 2 s, uma linha <span class="inline-code">ANOMALIA</span> quando o detector dispara e uma <span class="inline-code">ALIVIO</span> por decisão do degrau 1.</p></div>' +
     '<div class="view-tools"><button class="btn btn-sm btn-ghost" data-refresh="1">' + ICON.refresh + "Recarregar</button></div></div>" +
     slotHtml("") +
     '<div class="panel"><div class="panel-body" style="padding:10px 6px 10px 12px">' +

@@ -5,7 +5,7 @@ import json
 
 from conftest import make_sample, proc
 
-from sentinel import settings
+from sentinel import relief, settings
 from sentinel.detector import METRIC_CPU, SEV_WARNING, Finding
 from sentinel.incidents import METRIC_APP_FAILURE, Incident
 from sentinel.events import (
@@ -245,3 +245,100 @@ def test_reader_tolerates_schema_1_lines_alongside_schema_2(tmp_path):
     assert old["id"] in ids and new["id"] in ids
     assert store.find(old["id"])["schema"] == 1
     assert store.open_anomalies()[0]["id"] == old["id"]
+
+
+# -- a linha do alivio ------------------------------------------------------
+
+
+def _result(**kwargs):
+    base = dict(
+        action=relief.ACTION_LOWER,
+        reason=relief.OK,
+        pid=4242,
+        name="chrome",
+        from_level="normal",
+        to_level="abaixo-do-normal",
+        from_raw=32,
+        to_raw=16384,
+        ref="evt-20260922-120000-abcd",
+    )
+    base.update(kwargs)
+    return relief.ReliefResult(**base)
+
+
+def test_record_intervention_is_its_own_kind(tmp_path):
+    """Uma intervencao nao e um problema, e a resposta a um: misturar as duas
+    coisas no mesmo `kind` faria o historico contar como anomalia o que o
+    proprio Sentinel fez."""
+    store = EventStore(tmp_path / "events.jsonl")
+    event = store.record_intervention(_result(), now=_ts())
+
+    assert event["kind"] == "intervention"
+    assert event["id"].startswith("int-")
+    assert event["applied"] is True
+    assert event["shadow"] is False
+    assert event["ref"] == "evt-20260922-120000-abcd"
+    assert event["metric"] == relief.ACTION_LOWER
+    assert event["label"].startswith("FEZ chrome (pid 4242)")
+    assert event["detail"]["priority"]["from_raw"] == 32
+    assert store.find(event["id"]) == event
+
+
+def test_interventions_are_never_deduped(tmp_path):
+    """A segunda intervencao no mesmo app nao e a primeira repetida: e um fato
+    novo, com consequencia nova. O que limita a frequencia sao as guardas do
+    `relief`, nao o armazenamento."""
+    store = EventStore(tmp_path / "events.jsonl")
+    store.record_intervention(_result(), now=_ts())
+    store.record_intervention(_result(), now=_ts(minute=1))
+
+    assert len(store.interventions()) == 2
+
+
+def test_anomalies_and_interventions_stay_in_their_lanes(tmp_path):
+    """Os filtros de anomalia (`open_anomalies`, `latest_open`) continuam
+    achando uma abertura no meio de um historico cheio de intervencoes -- e o
+    dedupe nao colapsa nada com a linha do alivio no caminho."""
+    store = EventStore(tmp_path / "events.jsonl")
+    first = store.record_finding(_finding(), make_sample(ts=_ts()))
+    store.record_intervention(_result(), now=_ts(minute=1))
+    again = store.record_finding(_finding(value=95.0), make_sample(ts=_ts(minute=2)))
+
+    assert first["id"] == again["id"]
+    assert [e["id"] for e in store.anomalies()] == [first["id"]]
+    assert len(store.interventions()) == 1
+    assert store.latest_open()["id"] == first["id"]
+
+
+def test_shadow_decision_is_recorded_as_not_applied(tmp_path):
+    """O sombra so tem valor se cair no historico: `applied: False` com a
+    decisao escrita e a prova do que o Sentinel faria."""
+    store = EventStore(tmp_path / "events.jsonl")
+    event = store.record_intervention(
+        _result(reason=relief.SKIP_SHADOW, shadow=True), now=_ts()
+    )
+
+    assert event["applied"] is False
+    assert event["shadow"] is True
+    assert event["label"].startswith("SERIA ")
+
+
+def test_prune_takes_the_interventions_with_the_anomalies(tmp_path):
+    """Vida util compartilhada: apagar o historico velho nao pode deixar pra
+    tras justamente as linhas que dizem o que foi feito na maquina."""
+    path = tmp_path / "events.jsonl"
+    store = EventStore(path)
+    store.record_finding(_finding(), make_sample(ts=_ts()))
+    store.record_intervention(_result(), now=_ts())
+    old = "2020-01-01T00:00:00+00:00"
+    lines = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    for line in lines:
+        line["ts"] = old
+    path.write_text(
+        "\n".join(json.dumps(line, ensure_ascii=False) for line in lines) + "\n",
+        encoding="utf-8",
+    )
+
+    assert store.prune(older_than_days=30) == 2
+    assert store.anomalies() == []
+    assert store.interventions() == []

@@ -10,9 +10,9 @@ from pathlib import Path
 
 from sentinel import settings
 from sentinel.detector import Detector, Finding
-from sentinel.events import EventStore
+from sentinel.events import EventStore, STATUS_ADDRESSING
 from sentinel.sensor import Sensor, Sample
-from sentinel.stall import StallMonitor
+from sentinel.stall import METRIC_STALL, StallMonitor
 
 
 class AlreadyRunning(RuntimeError):
@@ -271,6 +271,32 @@ def build_incident_sources() -> list:
     return sources
 
 
+def build_relief_agent(paths: settings.Paths, overrides: dict | None = None):
+    """Monta o degrau 1 (rebaixar prioridade) pro loop, ou None se nao der.
+
+    Import tardio e `try` pelo mesmo motivo dos monitores de incidente: o
+    alivio e a unica parte da vigilancia que mexe no sistema de verdade, e uma
+    maquina sem psutil (ou com journal ilegivel) nao pode perder a amostragem
+    de CPU por causa dele. Sem agente, o Sentinel volta a ser so registro.
+
+    Nao e chamado por padrao dentro de `run_watch_loop`, de proposito: um teste
+    que injeta um culpado com pid inventado nao pode ver o daemon de produção
+    tocar num pid real. Quem quer o degrau ligado passa `relief=` explicito
+    (`__daemon-run` e `watch`).
+    """
+    try:
+        from sentinel.relief import ReliefAgent
+
+        return ReliefAgent(
+            paths=paths,
+            overrides=(
+                settings.load_overrides(paths) if overrides is None else overrides
+            ),
+        )
+    except Exception:
+        return None
+
+
 def run_watch_loop(
     paths: settings.Paths,
     *,
@@ -279,6 +305,7 @@ def run_watch_loop(
     detector: Detector | None = None,
     incident_sources: list | None = None,
     stall: StallMonitor | None = None,
+    relief=None,
     interval: float | None = None,
     sleep=time.sleep,
     clock=time.monotonic,
@@ -308,6 +335,12 @@ def run_watch_loop(
     que injeta `sleep` falso continua deterministico: dormir de mentirinha
     nao atrasa nada.
 
+    `relief` e o degrau 1 (rebaixar a prioridade do culpado que o `stall`
+    nomeou). `None` = desligado, e e assim que os testes ficam: o alivio mexe
+    em processo real, entao so liga quando o chamador passa um agente de
+    proposito (`build_relief_agent`). Pausado tambem desliga o degrau, junto
+    com o resto do registro.
+
     Pausado (`.sentinel/paused`) e mudo, nao fila: o sensor continua
     amostrando e os monitores continuam consumindo o proprio estado — a
     diferenca entre um processo vivo e um morto so existe naquele par de
@@ -327,6 +360,12 @@ def run_watch_loop(
 
     store.path.parent.mkdir(parents=True, exist_ok=True)
 
+    # O que um daemon morto deixou rebaixado volta antes de qualquer leitura
+    # nova: o usuario nao pode descobrir a lentidao do proprio navegador no
+    # dia seguinte sem que o Sentinel assuma o que fez.
+    for result in _relief_call(relief, "recover"):
+        _persist_intervention(store, paths, result)
+
     ticks = 0
     # None no primeiro tick: o estado e gravado no log mesmo sem transicao,
     # pra um buraco no historico nunca comecar sem explicacao.
@@ -334,6 +373,9 @@ def run_watch_loop(
     # Duracao real do ultimo `sleep`, e o intervalo pedido antes dele. O
     # primeiro ciclo nao tem historico de sono — nem sinal de inanicao.
     last_sleep_s: float | None = None
+    # id da anomalia `stall` do episodio atual: cada intervencao aponta pra
+    # la, e assim o historico conta a historia inteira, nao fatos soltos.
+    stall_ref = ""
     current = interval
     try:
         while True:
@@ -359,9 +401,21 @@ def run_watch_loop(
                 for finding in findings:
                     _persist(store, paths, finding, sample)
                 for incident in incidents:
-                    _persist_incident(store, paths, incident, sample)
+                    event = _persist_incident(store, paths, incident, sample)
+                    if incident.metric == METRIC_STALL and event:
+                        stall_ref = str(event.get("id") or stall_ref)
+            applied = False
+            for result in _relief_track(relief, stall, stall_ref, paused=paused):
+                _persist_intervention(store, paths, result, sample)
+                applied = applied or result.applied
+            if applied and stall_ref:
+                # O episodio saiu de "medido" pra "agindo sobre ele". So isso:
+                # quem diz que resolveu e o usuario, no ciclo de validacao do
+                # `fix` -- o degrau 1 nao fecha anomalia por conta propria.
+                store.set_status(stall_ref, STATUS_ADDRESSING)
             if stall.closed is not None:
                 _log_stall_clear(paths, sample, stall.closed)
+                stall_ref = ""
             _heartbeat(paths, sample, paused=paused, stalled=stall.stalled)
             if on_sample is not None:
                 on_sample(sample, findings)
@@ -378,6 +432,50 @@ def run_watch_loop(
             last_sleep_s = clock() - before
     except (KeyboardInterrupt, SystemExit):
         return ticks
+    finally:
+        # Saiu por Ctrl+C, SIGTERM ou excecao: o rebaixamento nao sai junto.
+        # Devolver e o ultimo ato do daemon, nao um Favor que ele espera
+        # merecer -- sem isso, o preco de um crash e um app lento pelo resto
+        # do dia, sem ninguem dizendo quem fez aquilo.
+        for result in _relief_call(relief, "shut_down"):
+            _persist_intervention(store, paths, result)
+
+
+def _relief_call(relief, method: str, *args, **kwargs) -> list:
+    """Uma chamada no agente de alivio, protegida.
+
+    O degrau 1 e o unico monitor que mexe no sistema, entao e o unico que pode
+    falhar por um motivo do mundo (o pid sumiu entre o indice e o `nice()`, o
+    journal estava sendo escrito). Uma excecao ali nao pode custar a amostragem
+    de CPU, que e o motivo do loop existir -- pelo mesmo preco, o ciclo seguinte
+    tenta de novo com o que o indice estiver vendo.
+    """
+    if relief is None:
+        return []
+    try:
+        return list(getattr(relief, method)(*args, **kwargs) or ())
+    except Exception:
+        return []
+
+
+def _relief_track(relief, stall: StallMonitor, ref: str, *, paused: bool) -> list:
+    """O ciclo do indice entregue ao degrau: culpado, episodio aberto, suspeita.
+
+    Pausado = sem intervencao, e sem `nada-a-fazer` gravado tambem: a pausa e
+    o usuario mandando calar a boca, e uma linha por tick mentiria sobre o que
+    o Sentinel deixou de fazer.
+    """
+    if relief is None or paused:
+        return []
+    last = stall.last
+    return _relief_call(
+        relief,
+        "track",
+        last.culprit if last is not None else None,
+        episode_open=stall.stalled,
+        suspect=stall.suspect,
+        ref=ref,
+    )
 
 
 def _log_pause(paths: settings.Paths, sample: Sample, paused: bool) -> None:
@@ -444,7 +542,7 @@ def _log_stall_clear(paths: settings.Paths, sample: Sample, episode: dict) -> No
 
 def _persist_incident(
     store: EventStore, paths: settings.Paths, incident, sample: Sample
-) -> None:
+) -> dict:
     event = store.record_incident(incident, now=sample.ts)
     line = (
         f"{_iso(sample.ts)} ANOMALIA {incident.metric} {incident.severity} "
@@ -452,6 +550,27 @@ def _persist_incident(
         f"id={event.get('id')} :: {incident.label}"
     )
     _append_daemon_line(paths, line)
+    return event
+
+
+def _persist_intervention(
+    store: EventStore,
+    paths: settings.Paths,
+    result,
+    sample: Sample | None = None,
+) -> None:
+    """A decisao do degrau 1 no log e no historico, com a palavra que o
+    usuario le: `ALIVIO`.
+
+    `sample` e opcional porque os dois momentos que nao tem batimento — o
+    daemon que assume o que o anterior deixou e o que encerra — tambem
+    intervem, e nesses casos o carimbo e o relogio de parede do evento.
+    """
+    event = store.record_intervention(result, now=None if sample is None else sample.ts)
+    stamp = _iso(sample.ts) if sample is not None else event.get("ts", "")
+    _append_daemon_line(
+        paths, f"{stamp} ALIVIO {result.label()} id={event.get('id')}"
+    )
 
 
 def _persist(store: EventStore, paths: settings.Paths, finding: Finding, sample: Sample) -> None:

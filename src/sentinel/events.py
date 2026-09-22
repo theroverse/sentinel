@@ -118,6 +118,9 @@ class EventStore:
             if e.get("kind") == "resolution" and e.get("ref") == event_id
         ]
 
+    def interventions(self) -> list[dict]:
+        return [e for e in self.all() if e.get("kind") == "intervention"]
+
     # -- escrita -------------------------------------------------------
 
     def _append_line(self, record: dict) -> None:
@@ -192,6 +195,21 @@ class EventStore:
         self._write_all(events)
         return record
 
+    def record_intervention(self, result, now: datetime.datetime | None = None) -> dict:
+        """Persiste uma decisao do alivio (`relief.ReliefResult`) como linha
+        `kind: intervention`.
+
+        Sem dedupe, de proposito: a segunda intervencao no mesmo app nao e a
+        primeira repetida — e um fato novo, com consequencia nova. E o
+        historico que da pra confiar no degrau 3 e exatamente a lista sem
+        buracos do que foi feito. O que limita a frequencia sao as guardas do
+        `relief`, nao o armazenamento.
+        """
+        moment = now or _utcnow()
+        record = self.build_intervention_record(result, moment)
+        self._append_line(record)
+        return record
+
     def build_anomaly_record(self, finding: Finding, now: datetime.datetime) -> dict:
         return {
             "schema": settings.EVENT_SCHEMA_VERSION,
@@ -233,6 +251,30 @@ class EventStore:
             "status": STATUS_OPEN,
             "fingerprint": incident.fingerprint,
             "occurrences": 1,
+        }
+
+    def build_intervention_record(self, result, now: datetime.datetime) -> dict:
+        """A linha de uma intervencao do alivio.
+
+        `kind` diferente de `anomaly` de proposito: uma intervencao nao e um
+        problema, e a resposta a um, e misturar as duas coisas no mesmo filtro
+        faria `events --metric relief_applied` contar como anomalia o que o
+        proprio Sentinel fez. `ref` aponta pra anomalia que abriu o episodio,
+        quando existia uma.
+        """
+        return {
+            "schema": settings.EVENT_SCHEMA_VERSION,
+            "id": new_id("int", now),
+            "ts": _iso(now),
+            "kind": "intervention",
+            "metric": result.action,
+            "action": result.action,
+            "reason": result.reason,
+            "shadow": result.shadow,
+            "applied": result.applied,
+            "ref": result.ref,
+            "label": result.label(),
+            "detail": result.to_detail(),
         }
 
     def _recent_matching_open(

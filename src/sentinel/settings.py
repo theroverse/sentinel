@@ -166,6 +166,42 @@ STALL_CULPRIT_SUSTAINED = 2
 # episodio passar por dentro, e pra saber a hora exata em que acabou.
 SAMPLE_INTERVAL_FAST_S = 0.5
 
+# --------------------------------------------------------------------------
+# Degrau 1 ("relief"): o teto reversivel que age enquanto a maquina trava
+# --------------------------------------------------------------------------
+# O unico degrau que funciona onde o travamento acontece e que se desfaz
+# sozinho: rebaixar a prioridade do culpado que o indice de estagnacao
+# sustentou. Nada aqui pede elevacao, e nada aqui mata processo.
+#
+# Ligado desde o primeiro dia (decisao do usuario, 2026-09-22) -- o que o
+# segura nao e uma autorizacao, sao as guardas abaixo e o arquivo `paused`.
+
+# Quantas intervencoes cabem numa janela de uma hora. Um app que renasce
+# travando nao pode virar loop de intervencao continua: o teto desliga o
+# degrau ate a janela virar.
+RELIEF_HOUR_LIMIT = 3
+
+# Segundos que um mesmo app (por NOME) fica protegido de novo alivio depois
+# de um. Nome, nao pid: pid e reciclado no Windows e o app que travou agora
+# e o mesmo que travou ha dois minutos, com outro numero.
+RELIEF_APP_COOLDOWN_S = 600
+
+# Quanto o nice sobe no POSIX (la maior numero = menos prioridade). No
+# Windows o degrau e uma constante de classe de prioridade, e este valor nao
+# e usado.
+RELIEF_NICE_STEP = 10
+
+# Diario das intervencoes: o que foi aplicado, em qual pid/instancia, e o
+# valor anterior. E o que permite devolver ao fim do episodio, e tambem o
+# que sobrevive a um daemon morto no meio -- sem ele, um crash deixaria um
+# app rebaixado para sempre sem ninguem sabendo a quem devolver.
+RELIEF_STATE_FILENAME = "relief.json"
+RELIEF_JOURNAL_MAX = 50
+
+# Ordens permanentes do caminho autonomo. Comeca com uma chave so (modo
+# sombra); a fase E acrescenta as ordens por app.
+ORDERS_FILENAME = "orders.json"
+
 
 # --------------------------------------------------------------------------
 # Falha de aplicativo (Event Log `Application`, lido por wevtutil local)
@@ -341,6 +377,15 @@ class Paths:
     @property
     def kb_db(self) -> Path:
         return self.output_dir / KB_DB_FILENAME
+
+    @property
+    def relief_state(self) -> Path:
+        """Diario do degrau 1: o que esta aplicado agora, e a quem devolver."""
+        return self.output_dir / RELIEF_STATE_FILENAME
+
+    @property
+    def orders(self) -> Path:
+        return self.output_dir / ORDERS_FILENAME
 
     def ensure_output_dir(self) -> Path:
         self.output_dir.mkdir(parents=True, exist_ok=True)

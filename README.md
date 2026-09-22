@@ -89,6 +89,8 @@ python sentinel.py fix                # tutorial guiado da mais recente
 python sentinel.py kb                 # o que a base já aprendeu
 python sentinel.py model status       # o motor local está vivo? anuncia o modelo?
 python sentinel.py kill <PID>         # encerra um processo-problema (seguro)
+python sentinel.py relief <PID>       # rebaixa a prioridade (degrau 1, na sua mão)
+python sentinel.py orders             # o que o Sentinel faz sozinho, e com que teto
 python sentinel.py pause              # para de registrar (kill-switch)
 python sentinel.py resume             # retoma
 python sentinel.py stop               # encerra o daemon
@@ -116,7 +118,8 @@ sem marcar nada como resolvido.
 ### Pausar sem interface: `sentinel pause`
 
 O interruptor é um arquivo: enquanto `.sentinel/paused` existir, o daemon
-**amostra, emite batimento e não registra nada**. Ele é lido a cada ciclo,
+**amostra, emite batimento e não registra nada** — e, desde o degrau 1, também
+não age: o agente de alívio nem é consultado. Ele é lido a cada ciclo,
 então vale também para o daemon que já está rodando, sobrevive a reboot e não
 depende de janela aberta — que é o requisito de um kill-switch.
 
@@ -134,6 +137,11 @@ flowchart TD
     A["daemon: sensor (psutil)"] --> B["detector: regras sustained"]
     A --> A2["fontes de incidente: Event Log + árvore de processos"]
     A2 --> C
+    A --> S["índice de estagnação: starved / thrash / disco"]
+    B --> S
+    S -->|"culpado nomeado"| R["degrau 1 (relief): prioridade reversível<br/><i>guardas: teto/hora, cooldown por nome, sombra</i>"]
+    R -->|decisão| V[".sentinel/events.jsonl<br/><i>kind: intervention, nunca deduplicado</i>"]
+    R -->|"devolve no fim do episódio"| J[".sentinel/relief.json<br/><i>diário: pid, nome, create_time, valor anterior</i>"]
     B --> C[".sentinel/events.jsonl<br/><i>anomalia deduplicada por fingerprint</i>"]
     C --> D["sentinel fix"]
     D --> K[".sentinel/kb.db<br/><i>camada 1: fingerprint · 2: métrica+causa · 3: métrica</i>"]
@@ -203,13 +211,82 @@ medição produziu. Sob `pause`, o índice continua medindo e o intervalo
 continua encurtando, mas nenhuma linha vai pro histórico.
 
 O catálogo curado da métrica tem três opções, nenhuma com `action` automática
-(o `fix` apresenta e você executa): rebaixar a prioridade do culpado no
-PowerShell da sua sessão, sem admin e sem fechar nada; ceder working set
+no `fix` (o tutor apresenta e você executa): rebaixar a prioridade do culpado
+no PowerShell da sua sessão, sem admin e sem fechar nada — exatamente o que o
+degrau 1 já faz sozinho quando o nomeia (`relief`, abaixo); ceder working set
 fechando janelas quando o sinal que abriu o episódio foi a paginação; e
 procurar recorrência no mesmo relógio, que é o que separa carga de trabalho
 de tarefa agendada. A frase de prova (`{evidence}`) é montada **só** com os
 números daquele episódio — no Windows, onde o psutil devolve `sin`/`sout`
 zerados, ela cita a carga de commit em vez de uma taxa que seria "0".
+
+### O degrau 1: alívio reversível (`relief`)
+
+Medir é a metade honesta do trabalho; a outra metade é tirar o peso de cima
+no momento crítico **sem destruir nada**. O degrau 1 faz uma coisa só: baixa a
+classe de prioridade do processo nomeado pelo índice de estagnação para
+`abaixo-do-normal`. Ele continua rodando — só para de passar na frente de
+todo mundo. Nada é fechado, nada é reiniciado, e o Windows devolve o que era
+quando o Sentinel devolve.
+
+A escada completa, e o que está ligado hoje:
+
+| degrau | ação | estado |
+| --- | --- | --- |
+| 1 | rebaixar prioridade do culpado | **ligado desde o primeiro dia**, sem ordem e sem selo |
+| 2 | teto de CPU por job | exige ordem por app (fase E) |
+| 3 | encerrar árvore do culpado | exige ordem por app (fase E) |
+| — | teto de RAM | **nunca automático**: só aparece no tutorial, e você executa |
+
+Rebaixar é automático porque é reversível, imediato e não perde trabalho: o
+pior caso é um build terminar mais tarde. Fechar processo não tem essa
+garantia, e por isso os degraus 2 e 3 continuam pedindo autorização.
+
+**As guardas** (limite de intervenção, não de confiança):
+
+- **teto de uma hora** — no máximo `RELIEF_HOUR_LIMIT` (3) intervenções por
+  hora. Cada decisão conta, inclusive as que o modo sombra só simulou: o
+  teto existe pra limitar o que o Sentinel *decidiu*, não o que ele tocou.
+- **cooldown por app** — `RELIEF_APP_COOLDOWN_S` (600 s) sem repetir o mesmo
+  **nome**. É por nome e não por PID porque PID é reciclado: o processo novo
+  não deve sair impune, e o antigo não deve ser punido duas vezes.
+- **`paused`** — com a vigilância pausada o agente não é nem consultado. Ele
+  devolve o que estiver rebaixado ao encerrar, e o histórico não ganha linha.
+- **lista protegida e o próprio Sentinel** — recusados sempre, no automático e
+  no manual (`is_protected` / `is_self`).
+- **limite declarado, não furado** — `AccessDenied` vira `sem-alcance` no
+  log. Não há UAC, não há serviço, não há elevação em nenhum componente: o
+  que o Sentinel não alcança com o seu usuário, ele diz que não alcança.
+
+**Devolver.** Cada rebaixamento aplicado entra no diário
+`.sentinel/relief.json` com pid, nome e o valor de prioridade anterior, e o
+`create_time` do processo — é o que prova que o pid de agora é o mesmo
+processo de antes. Um pid que sumiu e foi reciclado **nunca** é devolvido: o
+diário é lido, a identidade confere ou a ação não acontece. O revert dispara
+no fim do episódio, e o que um daemon morto deixou rebaixado volta no primeiro
+tick do daemon novo (`recover`).
+
+**Modo sombra** (`orders shadow --on`): o Sentinel calcula, decide e grava
+cada intervenção como `SERIA …` sem tocar em processo nenhum. Não é o padrão
+— o degrau 1 age desde o início — mas é a única forma de ver o que ele faria
+antes de decidir confiar nele. Sombra não prende o que já foi aplicado: o
+revert continua valendo mesmo com o modo ligado.
+
+Você pode agir no mesmo degrau com a sua mão:
+
+```
+sentinel relief <PID>              # rebaixa, sem passar pelas guardas
+sentinel relief <PID> --restore    # devolve o valor que estava no histórico
+sentinel orders                    # o que está autorizado, com que teto
+sentinel events --interventions    # a auditoria: uma linha por decisão
+```
+
+Toda intervenção vira uma linha `kind: "intervention"` no `events.jsonl`, com
+`ref` apontando para a anomalia `stall` do episódio. Essa linha **não é
+deduplicada** — o registro do que foi feito é justamente o que compra a
+confiança para os degraus 2 e 3. Depois de agir, o episódio passa de `open`
+para `addressing`, e para aí: quem diz que resolveu é você, no ciclo de
+validação do `fix`.
 
 ### A base de conhecimento local (`.sentinel/kb.db`)
 
@@ -295,14 +372,16 @@ para outra máquina faz o Sentinel recusar a pergunta, não obedecer.
 | Comando | O que faz |
 | --- | --- |
 | `start` / `stop` | Liga/desliga o daemon de vigilância (pidfile em `.sentinel/daemon.pid`). |
-| `status` | Diz se o daemon está vivo, o último batimento, se a vigilância está pausada e quantas anomalias estão abertas. |
-| `pause` / `resume` | Kill-switch sem GUI: `.sentinel/paused` existe → o daemon amostra mas não registra nada (e, a partir da fase D, não age). Sobrevive a reboot e a daemon morto. |
-| `watch [--once]` | Roda a vigilância em primeiro plano (Ctrl+C para); `--once` faz um tick. |
-| `events [--open-only] [--limit N] [--json]` | Lista anomalias. |
+| `status` | Diz se o daemon está vivo, o último batimento, se a vigilância está pausada, o estado do modo sombra e quantas anomalias estão abertas. |
+| `pause` / `resume` | Kill-switch sem GUI: `.sentinel/paused` existe → o daemon amostra mas não registra nada (e não age). Sobrevive a reboot e a daemon morto. |
+| `watch [--once]` | Roda a vigilância em primeiro plano (Ctrl+C para); `--once` faz um tick — e desliga o degrau 1 de propósito, pra um diagnóstico não correr na frente do daemon. |
+| `events [--open-only] [--limit N] [--interventions] [--json]` | Lista anomalias; `--interventions` troca a lista pelo histórico de alívio. |
 | `fix [ID]` | Ciclo de tutoria sobre uma anomalia (padrão: a mais recente aberta). `--explain-source` diz qual camada respondeu e o que pesou no ranking. |
 | `kb [--json]` | Inventário da base local: tipos, opções (curadas × aprendidas) e desfechos por anomalia. |
 | `model status [--json]` | Sonda o motor local: vivo? que dialeto? anuncia o modelo pedido? Só leitura — não instala nem baixa nada. |
 | `kill <PID> [--tree]` | Encerra um processo com lista protegida + confirmação; `--tree` inclui descendentes. |
+| `relief <PID> [--restore]` | Sua mão no degrau 1: rebaixa (ou devolve, com `--restore`, usando o valor anterior que está no histórico). Passa pelas recusas — lista protegida, processo morto, sem alcance — e **não** pelas guardas de teto/cooldown: quem mandou foi você. |
+| `orders [shadow [--on\|--off]]` | Mostra o que está autorizado no caminho autônomo (degraus, guardas, ausência de elevação) e liga/desliga o modo sombra em `.sentinel/orders.json`. |
 | `prune --older-than DIAS` | Apaga eventos antigos. |
 | `config [--show-source]` | Mostra limiares ativos e caminhos. |
 
@@ -341,10 +420,22 @@ No Windows o `thrashing` é carregado pelo **commit**: o psutil documenta que
 sout=0`), então a taxa só conta em Linux — onde a unidade segue o psutil da
 plataforma, e por isso o número é configurável e não absoluto.
 
+### Guardas do degrau 1
+
+As guardas do degrau 1 também se sobrescrevem por `config.json`:
+
+| Guarda | Padrão | O que limita |
+| --- | --- | --- |
+| `RELIEF_HOUR_LIMIT` | 3 | decisões de intervenção por hora (sombra conta junto) |
+| `RELIEF_APP_COOLDOWN_S` | 600 s | repetição sobre o mesmo **nome** de app |
+| `RELIEF_JOURNAL_MAX` | 50 | entradas vivas no diário `.sentinel/relief.json` |
+| `RELIEF_NICE_STEP` | 10 | passo do `nice` em POSIX, onde não existe classe de prioridade |
+
 ## Formato do evento (`.sentinel/events.jsonl`)
 
-Append-only, uma linha = um JSON. Dois tipos: `anomaly` e `resolution`
-(ligada por `ref`).
+Append-only, uma linha = um JSON. Três tipos: `anomaly`, `resolution`
+(ligada por `ref`) e `intervention` — o que o degrau 1 decidiu, fez ou
+deixou de fazer.
 
 ```json
 {"schema": 1, "id": "evt-20260921-142031-a3f1", "ts": "2026-09-21T14:20:31+00:00",
@@ -385,6 +476,37 @@ vocabulário do `fix --explain-source`: `kb:fingerprint`, `kb:causa`,
 `kb:metrica` ou `modelo`. É ela que permite auditoria — "resolveu" separado
 de "quem sugeriu".
 
+A linha `intervention` é o caderno do degrau 1: uma por decisão, nunca
+deduplicada mesmo quando o processo é o mesmo, porque o que está sob auditoria
+é a conduta, não o fato.
+
+```json
+{"schema": 2, "id": "int-20260922-181904-89ea", "ts": "2026-09-22T18:19:04+00:00",
+ "kind": "intervention", "metric": "priority_below_normal",
+ "action": "priority_below_normal", "reason": "ok", "shadow": false,
+ "applied": true, "ref": "evt-20260922-181857-4b21",
+ "label": "FEZ chrome (pid 8124): prioridade -> abaixo-do-normal [ok]",
+ "detail": {"action": "priority_below_normal",
+            "target": {"pid": 8124, "name": "chrome"},
+            "priority": {"from": "normal", "from_raw": 32,
+                         "to": "abaixo-do-normal", "to_raw": 16384},
+            "reason": "ok", "shadow": false}}
+```
+
+`applied` é a verdade da linha: `false` com `reason` `modo-sombra`,
+`teto-de-uma-hora`, `cooldown-do-app`, `processo-protegido`,
+`processo-inalcancavel`, `sem-alcance` ou `sem-alavanca` diz o que o Sentinel
+deixou de fazer e por quê. `ref` aponta para a anomalia do episódio — no
+caminho manual (`sentinel relief <PID>`) é a string `manual`. O `*_raw` é o
+número da plataforma, e é dele que o `relief <PID> --restore` precisa: sem
+`from_raw` não existe "devolver".
+
+As quatro ações possíveis são `priority_below_normal`, `priority_restored`,
+`priority_boost_self` e `priority_restore_self` — as duas últimas são o
+Sentinel devolvendo prioridade a si mesmo depois de um rebaixamento herdado, e
+não contam para o teto nem entram no diário. `reason` `nada-a-fazer` nunca é
+gravado: é o ruído de cada ciclo em que nada mudou.
+
 ## Estrutura do projeto
 
 ```
@@ -397,6 +519,8 @@ sentinel/
 │   ├── daemon.py           # start/stop/status + loop de vigilância
 │   ├── detector.py         # regras sustained → Findings
 │   ├── stall.py            # índice de estagnação (starved/thrashing/disco)
+│   ├── relief.py           # degrau 1: prioridade reversível + guardas + sombra
+│   ├── orders.py           # orders.json: o que foi autorizado (modo sombra)
 │   ├── incidents.py        # fotografia da árvore → Incident (órfãos)
 │   ├── appfail.py          # Event Log (wevtutil /f:xml) → Incident
 │   ├── events.py           # EventStore JSONL (append + dedupe + resolução)
@@ -449,6 +573,13 @@ fakes): nem a suíte nem o `fix` de teste abrem socket. O teste marcado `live`
   disso não tem camada 3: depende da camada 4 pra ser aprendida.
 - Falha de app é lida do Event Log *depois* do fato: o Sentinel registra e
   explica, não impede o crash.
+- O degrau 1 alcança só o que o seu usuário alcança. Sem elevação em nenhum
+  componente — por decisão registrada —, processo de outro usuário ou
+  protegido vira `sem-alcance` / `processo-protegido` no histórico, e o
+  Sentinel segue sem tentar de novo por outro caminho.
+- Rebaixar prioridade não é teto: um processo que se reposicione
+  (`SetPriorityClass` por conta própria) volta a subir, e o Sentinel só
+  reencontra ele no próximo episódio, depois do cooldown do nome.
 - A árvore de órfãos é reconhecida por *transição* entre amostras: um
   processo que morre e deixa filhos entre dois batimentos. O primeiro
   batimento nunca emite nada (aquecimento).
