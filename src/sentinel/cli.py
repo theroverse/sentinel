@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
 
-from sentinel import __version__, daemon, settings
+from sentinel import __version__, api, daemon, settings
 from sentinel.events import EventStore
 from sentinel.sensor import Sensor
 
@@ -27,6 +28,11 @@ COMANDOS
     stop                 Encerra o daemon.
     status               Diz se o daemon esta vivo, a ultima amostra, se a
                          vigilancia esta pausada e quantos eventos abertos.
+                         --json responde pra maquina, sem medir nada.
+    metrics              Leitura unica do painel: amostra medida agora, serie
+                         do daemon.log, limiares, processos com as travas
+                         marcadas, anomalias, resolucoes, intervencoes e o
+                         fim do log. --json e o que a GUI lee.
     pause / resume       Kill-switch sem GUI: para/retoma o registro de
                          anomalias gravando/apagando .sentinel/paused. Vale
                          mesmo com o daemon morto (sobrevive a reboot).
@@ -39,6 +45,10 @@ COMANDOS
                          valida cada uma; se nao resolveu, passa pra
                          proxima. --explain-source mostra a camada da base
                          que respondeu.
+                         Em modo maquina: --plan --json devolve as opcoes
+                         (com a 'key' de cada uma) sem dialogo, e --resolve
+                         <fixed|not_fixed|dismissed> --option N --key K --json
+                         grava a decisao que voce tomou na interface.
     kb                   Inventario da base local: tipos conhecidos, opcoes,
                          o que foi aprendido do modelo e os desfechos que
                          voce registrou. --json.
@@ -47,7 +57,9 @@ COMANDOS
                          nao baixa. --json.
     kill <PID>           Encerra um processo problema com protecao de
                          lista do sistema + confirmacao. --tree inclui
-                         descendentes.
+                         descendentes. --yes diz que a confirmacao ja
+                         aconteceu (foi a GUI, nao o terminal); sem ela numa
+                         sessao sem tty o kill recusa do mesmo jeito.
     orders               O que o Sentinel pode fazer sem pedir, e o modo
                          sombra: `orders shadow --on|--off` decide se o
                          degrau 1 age ou so grava o que faria.
@@ -108,15 +120,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("start", help="Inicia o daemon em background.")
-    sub.add_parser("stop", help="Encerra o daemon.")
-    sub.add_parser("status", help="Estado do daemon + resumo.")
+    metrics = sub.add_parser(
+        "metrics",
+        help="Leitura única do painel (amostra, série, processos, eventos) em JSON.",
+    )
+    metrics.add_argument(
+        "--json", action="store_true", help="Resposta de máquina (o que a GUI lê)."
+    )
+    metrics.add_argument(
+        "--history",
+        type=int,
+        default=60,
+        metavar="N",
+        help="Batimentos do daemon.log que viram série de gráfico.",
+    )
+    metrics.add_argument(
+        "--limit", type=int, default=60, metavar="N", help="Máximo de anomalias."
+    )
+    metrics.add_argument(
+        "--log", type=int, default=60, metavar="N", help="Linhas do fim do log."
+    )
 
-    sub.add_parser(
+    start_p = sub.add_parser("start", help="Inicia o daemon em background.")
+    start_p.add_argument("--json", action="store_true", help="Resposta de máquina.")
+    stop_p = sub.add_parser("stop", help="Encerra o daemon.")
+    stop_p.add_argument("--json", action="store_true", help="Resposta de máquina.")
+
+    status_p = sub.add_parser("status", help="Estado do daemon + resumo.")
+    status_p.add_argument("--json", action="store_true", help="Resposta de máquina.")
+
+    pause_p = sub.add_parser(
         "pause",
         help="Pausa o registro de anomalias (kill-switch em .sentinel/paused).",
     )
-    sub.add_parser("resume", help="Retoma o que o 'pause' pausou.")
+    pause_p.add_argument("--json", action="store_true", help="Resposta de máquina.")
+    resume_p = sub.add_parser("resume", help="Retoma o que o 'pause' pausou.")
+    resume_p.add_argument("--json", action="store_true", help="Resposta de máquina.")
 
     watch_p = sub.add_parser("watch", help="Roda a vigilancia em 1o plano.")
     watch_p.add_argument(
@@ -152,6 +191,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Antes do tutorial, diz de qual camada da base veio a sugestao "
         "e o que pesou no ranking.",
     )
+    fix_p.add_argument(
+        "--plan",
+        action="store_true",
+        help="So as opcoes, sem ciclo de validacao (modo maquina: --json).",
+    )
+    fix_p.add_argument(
+        "--resolve",
+        choices=("fixed", "not_fixed", "dismissed"),
+        default=None,
+        metavar="DESFEOCHO",
+        help="Grava a sua decisao sobre a anomalia: fixed, not_fixed ou "
+        "dismissed. com --option e um passo do ciclo; sem ele, a fila acabou.",
+    )
+    fix_p.add_argument(
+        "--option",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Qual opcao do plano foi validada (1 = a primeira).",
+    )
+    fix_p.add_argument(
+        "--key",
+        default="",
+        metavar="CHAVE",
+        help="key da opcao (vem do --plan); e o que liga o desfecho a base local.",
+    )
+    fix_p.add_argument(
+        "--source",
+        default="",
+        metavar="FONTE",
+        help="De onde veio a opcao (campo 'fonte' do --plan).",
+    )
+    fix_p.add_argument("--note", default="", help="Nota opcional na linha de resolucao.")
+    fix_p.add_argument("--json", action="store_true", help="Resposta de maquina.")
 
     kb_p = sub.add_parser(
         "kb", help="O que a base local (.sentinel/kb.db) ja sabe desta maquina."
@@ -180,6 +253,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Inclui processos descendentes na arvore a encerrar.",
     )
+    kill_p.add_argument(
+        "--yes",
+        action="store_true",
+        help="A confirmacao ja aconteceu do lado de quem pediu (a GUI pergunta "
+        "antes de chamar). Sem --yes numa sessao sem tty o kill recusa, igual.",
+    )
+    kill_p.add_argument("--json", action="store_true", help="Resposta de maquina.")
 
     relief_p = sub.add_parser(
         "relief",
@@ -232,52 +312,149 @@ def _store(paths: settings.Paths) -> EventStore:
     return EventStore(paths.events)
 
 
-def cmd_start(paths: settings.Paths, args: argparse.Namespace) -> int:
-    try:
-        pid = daemon.start(paths)
-    except daemon.AlreadyRunning as exc:
-        print(f"[WARN] {exc}")
+def _machine(args: argparse.Namespace) -> bool:
+    """O pedido veio de uma maquina (`--json`)?"""
+    return bool(getattr(args, "json", False))
+
+
+def _answered(args: argparse.Namespace, build, human) -> int:
+    """A mesma resposta, dois publicos.
+
+    Com `--json` o texto formatado nao existe: quem chama quer o dado, e uma
+    resposta que so sai bonita no terminal obrigaria a GUI a fazer parse de
+    prosa. No caminho do JSON o stdout e sagrado (so o payload sai nele),
+    entao qualquer sussurro do motor — como o aviso do `local_model` de que
+    nao ha motor na maquina — e trancado no stderr durante a construcao.
+    """
+    if not _machine(args):
+        human()
         return 0
-    print(f"Daemon iniciado (pid {pid}). Logs em {paths.daemon_log}")
-    return 0
+    with contextlib.redirect_stdout(sys.stderr):
+        payload = build()
+    print(api.dump(payload))
+    return 1 if isinstance(payload, dict) and payload.get("ok") is False else 0
+
+
+def cmd_start(paths: settings.Paths, args: argparse.Namespace) -> int:
+    def build():
+        try:
+            pid = daemon.start(paths)
+        except daemon.AlreadyRunning as exc:
+            return {"ok": True, "started": False, "pid": None, "warning": str(exc)}
+        return {"ok": True, "started": True, "pid": pid, "log": str(paths.daemon_log)}
+
+    def human():
+        try:
+            pid = daemon.start(paths)
+        except daemon.AlreadyRunning as exc:
+            print(f"[WARN] {exc}")
+            return
+        print(f"Daemon iniciado (pid {pid}). Logs em {paths.daemon_log}")
+
+    return _answered(args, build, human)
 
 
 def cmd_stop(paths: settings.Paths, args: argparse.Namespace) -> int:
-    try:
-        pid = daemon.stop(paths)
-    except daemon.NotRunning:
-        # pidfile obsoleto: limpa pra proximo start nao esbarrar.
+    def build():
         try:
-            paths.pid.unlink()
-        except OSError:
-            pass
-        print("Daemon nao estava rodando.")
-        return 0
-    print(f"Daemon encerrado (pid {pid}).")
-    return 0
+            pid = daemon.stop(paths)
+        except daemon.NotRunning:
+            _clear_stale_pidfile(paths)
+            return {"ok": True, "stopped": False, "pid": None}
+        return {"ok": True, "stopped": True, "pid": pid}
+
+    def human():
+        try:
+            pid = daemon.stop(paths)
+        except daemon.NotRunning:
+            _clear_stale_pidfile(paths)
+            print("Daemon nao estava rodando.")
+            return
+        print(f"Daemon encerrado (pid {pid}).")
+
+    return _answered(args, build, human)
+
+
+def _clear_stale_pidfile(paths: settings.Paths) -> None:
+    """pidfile obsoleto: limpa pra proximo start nao esbarrar."""
+    try:
+        paths.pid.unlink()
+    except OSError:
+        pass
 
 
 def cmd_status(paths: settings.Paths, args: argparse.Namespace) -> int:
     st = daemon.status(paths)
-    if st.running:
-        print(f"Daemon: VIVO (pid {st.pid})")
-        if st.last_heartbeat:
-            print(f"Ultimo batimento: {st.last_heartbeat.isoformat()}")
-    else:
-        if st.pid:
-            print(f"Daemon: MORTO (pidfile obsoleto: {st.pid}; rode 'stop' p/ limpar)")
+    opens = _store(paths).open_anomalies()
+
+    def human():
+        if st.running:
+            print(f"Daemon: VIVO (pid {st.pid})")
+            if st.last_heartbeat:
+                print(f"Ultimo batimento: {st.last_heartbeat.isoformat()}")
         else:
-            print("Daemon: parado")
+            if st.pid:
+                print(
+                    f"Daemon: MORTO (pidfile obsoleto: {st.pid}; rode 'stop' p/ limpar)"
+                )
+            else:
+                print("Daemon: parado")
 
-    _print_pause_state(paths, st.paused)
-    _print_shadow_state(paths)
+        _print_pause_state(paths, st.paused)
+        _print_shadow_state(paths)
 
-    store = _store(paths)
-    opens = store.open_anomalies()
-    print(f"Eventos abertos: {len(opens)}")
-    for finding in opens[-5:]:
-        print(f"  - {_event_line(finding)}")
-    return 0
+        print(f"Eventos abertos: {len(opens)}")
+        for finding in opens[-5:]:
+            print(f"  - {_event_line(finding)}")
+
+    return _answered(args, lambda: api.status(paths), human)
+
+
+def cmd_metrics(paths: settings.Paths, args: argparse.Namespace) -> int:
+    """A resposta única do painel: a GUI inteira cabe numa chamada.
+
+    Cinco chamadas de processo filho a cada atualizacao custariam mais que o
+    monitoramento que elas mostram, e ainda entregariam cinco instantes
+    diferentes na mesma tela.
+    """
+
+    def build():
+        return api.dashboard(
+            paths,
+            events_limit=args.limit,
+            log_lines_limit=args.log,
+            history=args.history,
+        )
+
+    def human():
+        sample = api.live_sample()
+        print(f"Amostra {sample['ts']}")
+        print(f"  cpu {sample['cpu_percent']}%   ram {sample['ram_percent']}%")
+        print(
+            f"  disco {sample['disk_percent']}% ({sample['disk_path']})   "
+            f"io {sample['io_busy_percent']}%"
+        )
+        print(
+            f"  rede {sample['net_recv_bps']:.0f} down / "
+            f"{sample['net_sent_bps']:.0f} up bps"
+        )
+        print("  topo:")
+        for proc in sample["top_cpu"]:
+            print(
+                f"    {proc['pid']:<8} {proc['name']:<28} "
+                f"cpu {proc['cpu']:.1f}%  rss {proc['rss_mb']:.0f} MB"
+            )
+        print("\nUse --json pra resposta de maquina (painel completo).")
+
+    try:
+        Sensor()
+    except Exception as exc:  # sem psutil nao ha o que medir — e dito, nao fingido
+        if _machine(args):
+            print(api.dump({"ok": False, "error": f"sem sensor: {exc}"}))
+        else:
+            print(f"[ERRO] metricas indisponiveis: {exc}", file=sys.stderr)
+        return 1
+    return _answered(args, build, human)
 
 
 def _print_pause_state(paths: settings.Paths, paused: bool) -> None:
@@ -310,28 +487,52 @@ def _print_shadow_state(paths: settings.Paths) -> None:
 def cmd_pause(paths: settings.Paths, args: argparse.Namespace) -> int:
     daemon.pause(paths)
     st = daemon.status(paths)
-    if st.running:
-        print(
-            f"Vigilancia pausada (daemon pid {st.pid} segue amostrando; para de "
-            "registrar anomalias no proximo batimento)."
-        )
-    else:
-        print(
-            "Vigilancia pausada. O daemon nao esta rodando agora — quando "
-            "subir, ja sobe pausado (e assim que sobrevive a reboot)."
-        )
-    print(f"Arquivo: {paths.paused}")
-    return 0
+
+    def human():
+        if st.running:
+            print(
+                f"Vigilancia pausada (daemon pid {st.pid} segue amostrando; para de "
+                "registrar anomalia no proximo batimento)."
+            )
+        else:
+            print(
+                "Vigilancia pausada. O daemon nao esta rodando agora — quando "
+                "subir, ja sobe pausado (e assim que sobrevive a reboot)."
+            )
+        print(f"Arquivo: {paths.paused}")
+
+    return _answered(
+        args,
+        lambda: {"ok": True, "paused": True, "file": str(paths.paused)},
+        human,
+    )
 
 
 def cmd_resume(paths: settings.Paths, args: argparse.Namespace) -> int:
-    if not daemon.resume(paths):
-        print("Nada estava pausado.")
-        return 0
+    resumed = daemon.resume(paths)
     st = daemon.status(paths)
-    state = f"no proximo batimento (pid {st.pid})" if st.running else "quando o daemon subir"
-    print(f"Vigilancia retomada {state}.")
-    return 0
+
+    def human():
+        if not resumed:
+            print("Nada estava pausado.")
+            return
+        state = (
+            f"no proximo batimento (pid {st.pid})"
+            if st.running
+            else "quando o daemon subir"
+        )
+        print(f"Vigilancia retomada {state}.")
+
+    return _answered(
+        args,
+        lambda: {
+            "ok": True,
+            "paused": False,
+            "was_paused": resumed,
+            "running": st.running,
+        },
+        human,
+    )
 
 
 def cmd_watch(paths: settings.Paths, args: argparse.Namespace) -> int:
@@ -472,24 +673,120 @@ def _explain_source(db, event: dict) -> None:
     print()
 
 
+def _fix_target(store: EventStore, event_id: str | None):
+    """A anomalia do pedido, ou None. Sem id, a mais recente aberta — a mesma
+    regra do ciclo de terminal, pra GUI e mao pedirem a mesma coisa."""
+    if event_id:
+        event = store.find(event_id)
+        return event if event and event.get("kind") == "anomaly" else None
+    return store.latest_open()
+
+
+def _fix_missing(args: argparse.Namespace, *, event_id: str | None) -> int:
+    """Sem alvo, dois casos que nao se confundem: um id errado e uma historia
+    sem anomalia aberta. O primeiro e erro de quem pediu; o segundo e o
+    estado mais saudavel que existe."""
+    if event_id:
+        message = f"anomalia nao encontrada: {event_id}"
+        if _machine(args):
+            print(api.dump({"ok": False, "error": message}))
+        else:
+            print(f"[ERROR] {message}")
+        return 1
+    if _machine(args):
+        print(
+            api.dump(
+                {
+                    "ok": True,
+                    "event_id": None,
+                    "options": [],
+                    "fonte": "",
+                    "camada": 0,
+                    "motivo": "nenhuma anomalia aberta",
+                }
+            )
+        )
+    else:
+        print("Nenhuma anomalia aberta pra corrigir. Rode 'sentinel status'.")
+    return 0
+
+
+def _print_plan(payload: dict) -> None:
+    from sentinel.tutor import render_option
+
+    options = payload.get("options") or []
+    total = len(options)
+    if not total:
+        print("A base local nao tem opcao para esta anomalia.")
+        return
+    for i, option in enumerate(options, start=1):
+        print(render_option(option, i, total))
+        print()
+    print(f"Fonte: {payload.get('fonte', '')} (camada {payload.get('camada', 0)})")
+
+
 def cmd_fix(paths: settings.Paths, args: argparse.Namespace) -> int:
     from sentinel.system.prompt import is_interactive
     from sentinel.tutor import run_cycle
 
     store = _store(paths)
+
+    if args.plan:
+        event = _fix_target(store, args.event_id)
+        if event is None:
+            return _fix_missing(args, event_id=args.event_id)
+        with contextlib.redirect_stdout(sys.stderr):
+            payload = api.plan(paths, event)
+        if _machine(args):
+            payload["ok"] = True
+            print(api.dump(payload))
+        else:
+            _print_plan(payload)
+        return 0
+
+    if args.resolve:
+        event = _fix_target(store, args.event_id)
+        if event is None:
+            return _fix_missing(args, event_id=args.event_id)
+        index = None if args.option is None else max(0, args.option - 1)
+        return _answered(
+            args,
+            lambda: api.resolve(
+                paths,
+                event,
+                outcome=args.resolve,
+                option_index=index,
+                key=args.key,
+                source=args.source,
+                note=args.note,
+            ),
+            lambda: print(
+                f"Resolucao gravada em {event.get('id')}: {args.resolve}"
+                + (f" (opcao {args.option})" if args.option else "")
+            ),
+        )
+
+    if _machine(args):
+        # Sem --plan nem --resolve o `fix` e um dialogo, e dialogo nao tem
+        # resposta de maquina: melhor dizer isto do que imprimir prosa no
+        # stdout de quem espera JSON.
+        print(
+            api.dump(
+                {
+                    "ok": False,
+                    "error": "fix em modo maquina exige --plan ou --resolve "
+                    "<desfecho>; sem flag ele e o ciclo de validacao no terminal",
+                }
+            )
+        )
+        return 1
+
     overrides = settings.load_overrides(paths)
     db = _kbstore(paths)
 
-    if args.event_id:
-        event = store.find(args.event_id)
-        if event is None or event.get("kind") != "anomaly":
-            print(f"[ERROR] anomalia nao encontrada: {args.event_id}")
-            return 1
-    else:
-        event = store.latest_open()
-        if event is None:
-            print("Nenhuma anomalia aberta pra corrigir. Rode 'sentinel status'.")
-            return 0
+    event = _fix_target(store, args.event_id)
+    if event is None:
+        return _fix_missing(args, event_id=args.event_id)
 
     headline = event.get("label") or (
         f"{event.get('metric')}/{event.get('severity')} "
@@ -587,18 +884,34 @@ def cmd_kill(paths: settings.Paths, args: argparse.Namespace) -> int:
     from sentinel.system.prompt import is_interactive
 
     ctl = ProcessCtl()
-    result = ctl.kill_tree(args.pid, interactive=is_interactive(), include_children=args.tree)
-
-    if result.refused:
-        print(f"[RECUSADO] {result.refused_reason}")
-        return 1
-    if result.ok:
-        print(f"Encerrado: pid(s) {', '.join(map(str, result.killed))}")
-        return 0
-    print(
-        f"[PARCIAL] encerrados {result.killed}; falharam {result.failed}"
+    # `--yes` nao fura guarda nenhuma: quem decide se o alvo pode morrer e a
+    # lista de protecao do Python, e ela vale com e sem confirmacao. O que o
+    # --yes substitui e a tecla — a interface ja perguntou antes de chamar.
+    interactive = is_interactive() or args.yes
+    result = ctl.kill_tree(
+        args.pid, interactive=interactive, include_children=args.tree
     )
-    return 1
+
+    def build():
+        return {
+            "ok": result.ok,
+            "pid": args.pid,
+            "killed": result.killed,
+            "failed": result.failed,
+            "refused": result.refused_reason,
+            "tree": bool(args.tree),
+        }
+
+    def human():
+        if result.refused:
+            print(f"[RECUSADO] {result.refused_reason}")
+        elif result.ok:
+            print(f"Encerrado: pid(s) {', '.join(map(str, result.killed))}")
+        else:
+            print(f"[PARCIAL] encerrados {result.killed}; falharam {result.failed}")
+
+    rc = _answered(args, build, human)
+    return rc if result.ok else 1
 
 
 def cmd_relief(paths: settings.Paths, args: argparse.Namespace) -> int:
@@ -830,6 +1143,7 @@ _COMMANDS = {
     "start": cmd_start,
     "stop": cmd_stop,
     "status": cmd_status,
+    "metrics": cmd_metrics,
     "pause": cmd_pause,
     "resume": cmd_resume,
     "watch": cmd_watch,

@@ -110,6 +110,13 @@ NET_SUSTAINED = 3
 # usado como referencia relativa (NET_WARNING_RATIO * p95).
 NET_BASELINE_WINDOW = 120
 
+# Janela de medição de `sentinel metrics`. Os contadores do psutil só dão uso
+# real na SEGUNDA leitura (a primeira arma o delta), então um CLI que roda uma
+# vez e sai precisa de dois ticks e do intervalo entre eles. É o preço de
+# responder com número medido em vez de 0.0 — e deliberadamente menor que
+# SAMPLE_INTERVAL_S porque a pergunta vem de uma interface esperando.
+METRICS_SETTLE_S = 0.6
+
 # --------------------------------------------------------------------------
 # Indice de estagnacao ("stall"): a maquina esta travando, nao so ocupada
 # --------------------------------------------------------------------------

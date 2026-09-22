@@ -373,19 +373,50 @@ para outra máquina faz o Sentinel recusar a pergunta, não obedecer.
 | --- | --- |
 | `start` / `stop` | Liga/desliga o daemon de vigilância (pidfile em `.sentinel/daemon.pid`). |
 | `status` | Diz se o daemon está vivo, o último batimento, se a vigilância está pausada, o estado do modo sombra e quantas anomalias estão abertas. |
+| `metrics [--json] [--history N] [--limit N] [--log N]` | Leitura única do painel: amostra, série dos gráficos, limiares ativos, eventos, resoluções, intervenções, processos (com as travas marcadas) e o fim do log. É a resposta que a interface consume — uma chamada, uma tela inteira. |
 | `pause` / `resume` | Kill-switch sem GUI: `.sentinel/paused` existe → o daemon amostra mas não registra nada (e não age). Sobrevive a reboot e a daemon morto. |
 | `watch [--once]` | Roda a vigilância em primeiro plano (Ctrl+C para); `--once` faz um tick — e desliga o degrau 1 de propósito, pra um diagnóstico não correr na frente do daemon. |
 | `events [--open-only] [--limit N] [--interventions] [--json]` | Lista anomalias; `--interventions` troca a lista pelo histórico de alívio. |
-| `fix [ID]` | Ciclo de tutoria sobre uma anomalia (padrão: a mais recente aberta). `--explain-source` diz qual camada respondeu e o que pesou no ranking. |
+| `fix [ID]` | Ciclo de tutoria sobre uma anomalia (padrão: a mais recente aberta). `--explain-source` diz qual camada respondeu e o que pesou no ranking. Em modo máquina: `--plan --json` devolve as opções com a `key` de cada uma, `--resolve fixed\|not_fixed\|dismissed --key … --json` grava a sua decisão. |
 | `kb [--json]` | Inventário da base local: tipos, opções (curadas × aprendidas) e desfechos por anomalia. |
 | `model status [--json]` | Sonda o motor local: vivo? que dialeto? anuncia o modelo pedido? Só leitura — não instala nem baixa nada. |
-| `kill <PID> [--tree]` | Encerra um processo com lista protegida + confirmação; `--tree` inclui descendentes. |
+| `kill <PID> [--tree] [--yes] [--json]` | Encerra um processo com lista protegida + confirmação; `--tree` inclui descendentes. `--yes` declara que a confirmação já aconteceu do lado de quem pediu (a GUI pergunta antes de chamar) — e não fura guarda nenhuma: processo protegido continua recusando, agora por resposta JSON com `ok: false`. |
 | `relief <PID> [--restore]` | Sua mão no degrau 1: rebaixa (ou devolve, com `--restore`, usando o valor anterior que está no histórico). Passa pelas recusas — lista protegida, processo morto, sem alcance — e **não** pelas guardas de teto/cooldown: quem mandou foi você. |
 | `orders [shadow [--on\|--off]]` | Mostra o que está autorizado no caminho autônomo (degraus, guardas, ausência de elevação) e liga/desliga o modo sombra em `.sentinel/orders.json`. |
 | `prune --older-than DIAS` | Apaga eventos antigos. |
 | `config [--show-source]` | Mostra limiares ativos e caminhos. |
 
 Flags globais: `--dir PASTA`, `--quiet`, `--version`.
+
+### Interface de máquina (`--json`)
+
+Existe porque a interface gráfica e um agente de terminal não leem texto
+formatado: `src/sentinel/api.py` é a única camada que responde em JSON, e ela
+não inventa regra nenhuma — limiar, severidade, lista protegida e recusa
+continuam morando no Python que ela chama.
+
+Três regras que quem consome pode assumir:
+
+- **stdout puro.** Com `--json`, o stdout é uma resposta (ou uma linha por
+  evento, no `events`) e o texto humano vai para o stderr. `json.loads(stdout)`
+  nunca falha por causa de um enfeite.
+- **código de saída diz a verdade.** `0` só quando a operação aconteceu. Um
+  `kill` recusado, um processo que não existe ou um `fix --json` sem `--plan`
+  saem com `ok: false` e código `1`.
+- **nada de segunda medição.** As séries e o último batimento vêm do
+  `.sentinel/daemon.log` — do que o daemon mediu. Quando o CLI precisa medir
+  ele mesmo (`metrics` sem daemon), espera `METRICS_SETTLE_S` porque o primeiro
+  `cpu_percent` do psutil só arma o contador: número inventado seria pior que
+  número atrasado.
+
+```bash
+python sentinel.py metrics --json | python -m json.tool   # o painel inteiro
+python sentinel.py fix <ID> --plan --json                 # as opções, com 'key'
+python sentinel.py fix <ID> --resolve fixed --option 0 --key <key> --json
+```
+
+Nada aqui sai da máquina: o JSON não tem identificador de instalação, URL de
+telemetria nem chamada de rede — é leitura do próprio território `.sentinel/`.
 
 ## Limiares (padrão)
 

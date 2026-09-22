@@ -63,12 +63,27 @@ fiação qualquer, o CLI ganha modo máquina, com testes:
 | `sentinel events --json` (já existe) | eventos + resoluções |
 | `sentinel status --json` | running/pid/last_heartbeat |
 | `sentinel fix <id> --plan --json` | opções (base local ou motor) sem perguntar nada |
-| `sentinel fix <id> --resolve --option N --outcome fixed\|not_fixed --json` | grava resolution sem tty |
-| `sentinel fix <id> --dismiss --json` | grava `outcome=dismissed` sem tty (o desfecho já existe em `tutor.RESPONSE_DISMISS`; falta a porta não-interativa) |
+| `sentinel fix <id> --resolve --option N --key <k> --outcome fixed\|not_fixed --json` | grava resolution sem tty |
+| `sentinel fix <id> --resolve dismissed --json` | o "pular" é um desfecho do mesmo portão — `--dismiss` à parte seria uma segunda porta para a mesma decisão |
 | `sentinel kill <pid> --yes --json` | `{killed, failed, refused_reason}` |
 
 `--yes` nunca substitui a recusa estrutural: processo protegido, `self` e
 sessão não-interativa continuam recusando no Python.
+
+**Feita** (`src/sentinel/api.py` + as flags no `cli.py`; testes em
+`tests/test_api.py` e `tests/test_cli.py`). Duas decisões saíram diferente
+da tabela acima, e melhor:
+
+- `--outcome` virou `--resolve fixed|not_fixed|dismissed` (um valor de escolha
+  em vez de flag booleana), e `--key` entrou no vocabulário: a `key` da opção
+  vem do `--plan` e volta no `--resolve`. Repropor para descobrir contra qual
+  opção gravar o "não funcionou" daria outra lista com motor ligado, e o
+  desfecho seria contado contra um conselho que ninguém viu.
+- `metrics --json` é um endpoint agregado, não a linha "última amostra" da
+  tabela: série (`daemon.log`), processos com `protected`/`self`, eventos,
+  resoluções, intervenções, limiares ativos, catálogo e o fim do log numa
+  resposta só. Cinco chamadas por atualização custariam mais que o
+  monitoramento mostrado e dariam cinco instantes diferentes na mesma tela.
 
 ### Fase 1 — GUI mock (esta entrega)
 
@@ -86,7 +101,7 @@ O adapter tem que fornecer o que o mock hoje fixa, ou a interface mente:
 `source` de cada rodada de tutoria (`kb:fingerprint` | `kb:causa` |
 `kb:metrica` | `modelo` — a badge "base local"
 do mock é hardcoded, `renderTutor`), `protected`/`self` calculados por
-`processctl` em vez de flag no JSON, e o `--dismiss` da tabela acima.
+`processctl` em vez de flag no JSON, e o desfecho do `fix --resolve`.
 
 **Eventos schema 2 (incidentes) não cabem no molde do `renderDetail`.**
 `app_failure` e `orphan_tree` chegam sem `value`, `threshold`, `window` nem
