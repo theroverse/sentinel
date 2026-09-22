@@ -24,10 +24,15 @@
       JS -> PS : { type: 'ready' | 'window-close' | 'window-minimize'
                          | 'window-drag' | 'engine-call',
                    payload: <o que o handler precisa> }
-      PS -> JS : { type: 'host-ready' | 'metrics' | 'events-list'
-                         | 'daemon-state' | 'tutor-options' | 'kill-result'
+      PS -> JS : { type: 'host-ready' | 'engine-reply'
                          | 'not-implemented' | 'bridge-error',
                    payload: <...> }
+
+      `engine-call` carrega { cmd, args, request_id }; a resposta e um unico
+      `engine-reply` { cmd, request_id, ok, result | error } — o `result` e o
+      JSON do CLI como TEXTO, nao re-serializado. O `request_id` volta igual
+      porque a pagina faz varias chamadas em voo e precisa saber a qual cada
+      resposta pertence.
 #>
 
 param()
@@ -233,25 +238,209 @@ function Send-ToJs {
 
 # ------------------------------------------------------------------ engine --
 <#
-    Fase 2: cada comando abaixo vira uma chamada ao CLI no modo maquina, com
-    a saida JSON repassada sem reinterpretacao. A lista de comandos permitidos
-    existe so para o host nunca virar canonicalizador de comando arbitrario.
+    Fase 2: cada comando abaixo e UMA chamada ao CLI no modo maquina (fase 0),
+    e a resposta JSON dele vai adiante sem reinterpretacao. A lista de
+    comandos permitidos existe so para o host nunca virar canonicalizador de
+    comando arbitrario: quem decide limiar, severidade, lista de protecao e
+    recusa e sempre o Python (`src/sentinel/api.py` + os modulos que ele chama).
+
+    O resultado viaja como TEXTO, nao como objeto: re-serializar um
+    ConvertFrom-Json pelo ConvertTo-Json do 5.1 e exatamente onde arrays
+    viram {"value":[...],"Count":N} e o acento vira escape. Assim o JSON que o
+    Python escreveu e o JSON que a pagina recebe, byte por byte.
+
+    Sem Python no PATH nada quebra: o host diz engineAvailable=false na
+    primeira mensagem e a pagina continua em mock.js, com a barra de titulo
+    dizendo isso.
 #>
 $AllowedEngineCommands = @(
     'metrics',      # python sentinel.py metrics --json
-    'events',       # python sentinel.py events --json
+    'events',       # python sentinel.py events --json      (JSONL -> array)
     'status',       # python sentinel.py status  --json
     'fix-plan',     # python sentinel.py fix <id> --plan --json
-    'fix-resolve',  # python sentinel.py fix <id> --resolve --option N --outcome ... --json
+    'fix-resolve',  # python sentinel.py fix <id> --resolve <outcome> --key K --json
     'kill',         # python sentinel.py kill <pid> --yes --json
-    'daemon'        # python sentinel.py start|stop  (recusa em sessao nao-interativa)
+    'daemon'        # python sentinel.py start|stop|pause|resume --json
 )
 
+# Quanto esperar por um filho Python. Um `metrics` custa ~0,6 s de medicao e o
+# resto e importa do interpretador; 15 s e folgado o bastante para um disco
+# ocupado sem deixar a janela pendurada para sempre.
+$EngineTimeoutMs = 15000
+
+function Resolve-EnginePython {
+    foreach ($c in @(
+        @{ Exe = 'py';      Prefix = @('-3') },
+        @{ Exe = 'python';  Prefix = @() },
+        @{ Exe = 'python3'; Prefix = @() })) {
+        if (Get-Command $c.Exe -ErrorAction SilentlyContinue) { return $c }
+    }
+    return $null
+}
+
+<#
+    Onde fica o territorio `.sentinel/` que esta instancia vigia. A ordem e a
+    do portavel:
+
+      1. SENTINEL_DIR, se voce disse qual e;
+      2. a pasta onde o exe/script esta (Sentinel.exe em D:\Ferramentas ->
+         D:\Ferramentas\.sentinel: o app e a pasta andam juntos);
+      3. %LOCALAPPDATA%\Sentinel\data, se a pasta do exe nao grava (midia
+         somente-leitura, Program Files sem permissao): melhor avisar do que
+         abrir uma janela que nao consegue escrever nada.
+#>
+function Resolve-DataRoot {
+    param([string]$ExeDir)
+    if ($env:SENTINEL_DIR) { return [pscustomobject]@{ Root = $env:SENTINEL_DIR; Why = 'SENTINEL_DIR' } }
+    $probe = Join-Path $ExeDir '.sentinel\bridge-probe'
+    try {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $probe) -Force -ErrorAction Stop | Out-Null
+        Set-Content -Path $probe -Value 'x' -Encoding ASCII -ErrorAction Stop
+        Remove-Item $probe -Force -ErrorAction SilentlyContinue
+        return [pscustomobject]@{ Root = $ExeDir; Why = 'pasta do aplicativo' }
+    }
+    catch {
+        $fallback = Join-Path $env:LOCALAPPDATA 'Sentinel\data'
+        try { New-Item -ItemType Directory -Path $fallback -Force -ErrorAction Stop | Out-Null } catch { }
+        return [pscustomobject]@{ Root = $fallback; Why = 'pasta do aplicativo e somente leitura; usando %LOCALAPPDATA%\Sentinel\data' }
+    }
+}
+
+$script:DataRoot = Resolve-DataRoot -ExeDir $ExeDir
+$script:EnginePython = Resolve-EnginePython
+$EngineCli = Join-Path $Root 'sentinel.py'
+
+function Engine-Available {
+    return [bool]($script:EnginePython -and (Test-Path $EngineCli))
+}
+
 function Invoke-EngineCli {
-    param([string]$Cmd, [hashtable]$Args)
-    # Stub honesto da fase 1: nem tentamos fingir que executamos. A GUI segue
-    # em modo mock e mostra 'not-implemented' como demonstração.
-    throw "A ponte com o motor chega na fase 2 (spec docs/superpowers/specs/2026-09-22-sentinel-gui-design.md); comando '$Cmd' ainda nao ligado."
+    <#
+        Roda `python sentinel.py --dir <territorio> <args...>` e devolve o
+        stdout como texto. Codigo de saida != 0 NAO e falha do bridge: um
+        `kill` recusado responde JSON com ok:false, e a verdade daquela
+        recusa mora no Python.
+    #>
+    param([string[]]$Words)
+
+    if (-not (Engine-Available)) {
+        if ($script:EnginePython) { throw "nao encontrei o entry-point do motor em $EngineCli" }
+        throw 'Python nao esta no PATH (py -3 / python / python3).'
+    }
+
+    $py = $script:EnginePython
+    $argList = @($py.Prefix) + @($EngineCli, '--dir', $script:DataRoot.Root) + $Words
+    $argString = ($argList | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    }) -join ' '
+
+    # UTF-8 forcado nos dois lados: sem isto, no Windows o filho escreve acento
+    # em cp1252 na pipe e a pagina recebe `?` no lugar do portugues.
+    [Environment]::SetEnvironmentVariable('PYTHONIOENCODING', 'utf-8', 'Process')
+
+    $tmp = Join-Path $env:TEMP ('sentinel-bridge-' + [guid]::NewGuid().ToString('N'))
+    $outFile = "$tmp.out.txt"
+    $errFile = "$tmp.err.txt"
+    try {
+        $proc = Start-Process -FilePath $py.Exe -ArgumentList $argString `
+            -WorkingDirectory $Root -NoNewWindow -PassThru `
+            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+        if (-not $proc.WaitForExit($EngineTimeoutMs)) {
+            try { $proc.Kill() } catch { }
+            throw "o motor nao respondeu em $([math]::Round($EngineTimeoutMs/1000)) s ($($Words[0]))."
+        }
+        $text = ''
+        if (Test-Path $outFile) {
+            # ReadAllText + UTF8 explicito: Get-Content do 5.1 chuta a codificacao
+            # pelo BOM, e sem BOM ele le cp1252 e quebra o acento.
+            $text = [System.IO.File]::ReadAllText($outFile, [System.Text.Encoding]::UTF8)
+        }
+        $err = ''
+        if (Test-Path $errFile) {
+            $err = [System.IO.File]::ReadAllText($errFile, [System.Text.Encoding]::UTF8)
+        }
+        $text = $text.Trim()
+        if (-not $text) {
+            if ($err) { throw ($err.Trim() -split "`r?`n" | Select-Object -Last 1) }
+            throw "o motor nao respondeu nada ($($Words[0]), codigo $($proc.ExitCode))."
+        }
+        return $text
+    }
+    finally {
+        Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Resposta de maquina em texto cru: `value` ja e JSON valido (veio do Python),
+# entao entra como valor, nao como string escapada.
+function Send-EngineReply {
+    param([string]$Cmd, $RequestId, [string]$ValueJson, [string]$Error)
+    $id = if ($null -eq $RequestId) { 'null' } else { ConvertTo-Json -InputObject $RequestId -Compress }
+    $msg = if ($Error) {
+        '{"type":"engine-reply","payload":{"cmd":' + (ConvertTo-Json -InputObject $Cmd -Compress) +
+        ',"request_id":' + $id + ',"ok":false,"error":' + (ConvertTo-Json -InputObject $Error -Compress) + '}}'
+    } else {
+        '{"type":"engine-reply","payload":{"cmd":' + (ConvertTo-Json -InputObject $Cmd -Compress) +
+        ',"request_id":' + $id + ',"ok":true,"result":' + $ValueJson + '}}'
+    }
+    $webView.CoreWebView2.PostWebMessageAsJson($msg)
+}
+
+# `events --json` e JSONL (uma linha por evento, do jeito que agentes ja leem):
+# vira array aqui, sem tocar no conteudo de cada linha.
+$EngineJsonlCommands = @('events')
+
+function Engine-Args {
+    <#
+        Traduz o pedido da pagina na linha de comando do motor. Nada aqui
+        decide regra: so passa parametro. Os valores vem de [string] do JS,
+        entao um pid/option que nao seja numero simplesmente nao vira opcao
+        (e o argparse do Python reclama antes de qualquer coisa).
+    #>
+    param([string]$Cmd, $P)
+
+    switch ($Cmd) {
+        'metrics' {
+            $w = @('metrics', '--json')
+            if ($P.history) { $w += @('--history', [string]$P.history) }
+            if ($P.limit) { $w += @('--limit', [string]$P.limit) }
+            if ($P.log) { $w += @('--log', [string]$P.log) }
+            return $w
+        }
+        'events' { return @('events', '--json') }
+        'status' { return @('status', '--json') }
+        'fix-plan' {
+            if (-not $P.id) { throw 'fix-plan precisa do id da anomalia.' }
+            return @('fix', [string]$P.id, '--plan', '--json')
+        }
+        'fix-resolve' {
+            if (-not $P.id) { throw 'fix-resolve precisa do id da anomalia.' }
+            $outcome = [string]$P.outcome
+            if ($outcome -notin @('fixed', 'not_fixed', 'dismissed')) {
+                throw "desfecho nao permitido: $outcome"
+            }
+            $w = @('fix', [string]$P.id, '--resolve', $outcome, '--json')
+            if ($P.option) { $w += @('--option', [string]$P.option) }
+            if ($P.key) { $w += @('--key', [string]$P.key) }
+            if ($P.source) { $w += @('--source', [string]$P.source) }
+            if ($P.note) { $w += @('--note', [string]$P.note) }
+            return $w
+        }
+        'kill' {
+            if (-not $P.pid) { throw 'kill precisa de um pid.' }
+            $w = @('kill', [string]$P.pid, '--yes', '--json')
+            if ($P.tree) { $w += '--tree' }
+            return $w
+        }
+        'daemon' {
+            $action = [string]$P.action
+            if ($action -notin @('start', 'stop', 'pause', 'resume', 'status')) {
+                throw "acao de daemon nao permitida: $action"
+            }
+            return @($action, '--json')
+        }
+    }
+    throw "comando sem traducao para o CLI: $Cmd"
 }
 
 function Handle-Message {
@@ -259,15 +448,22 @@ function Handle-Message {
 
     switch ($Msg.type) {
         'ready' {
-            # A interface avisou que carregou. Fase 1: engineAvailable=false faz
-            # a GUI ficar em mock.js e dizer isso na barra de titulo.
+            # A interface avisou que carregou. engineAvailable diz se ela vai
+            # pedir dados ao motor ou continuar no mock.js — e `why` explica o
+            # motivo, porque "sem ponte" sem causa nao e diagnostico, e enfeite.
+            $ok = Engine-Available
+            $why = if ($ok) { '' }
+            elseif (-not $script:EnginePython) { 'Python nao encontrado no PATH: a pagina segue com dados de exemplo.' }
+            else { "entry-point do motor ausente em $EngineCli." }
             Send-ToJs -Type 'host-ready' -Payload @{
                 app             = 'sentinel'
-                phase           = 'mock'
+                phase           = $(if ($ok) { 'engine' } else { 'mock' })
                 root            = $Root
-                engineAvailable = $false
+                data_root       = $script:DataRoot.Root
+                data_root_from  = $script:DataRoot.Why
+                engineAvailable = $ok
                 elevated        = [bool]$script:IsAdmin
-                notice          = 'Dados de exemplo: a ponte com o CLI e a fase 2 da spec.'
+                notice          = $why
             }
         }
         'window-close' {
@@ -280,24 +476,20 @@ function Handle-Message {
         }
         'engine-call' {
             $cmd = [string]$Msg.payload.cmd
+            $reqId = $Msg.payload.request_id
             if ($AllowedEngineCommands -notcontains $cmd) {
-                Send-ToJs -Type 'engine-reply' -Payload @{
-                    cmd = $cmd; ok = $false; error = "comando nao permitido: $cmd" }
+                Send-EngineReply -Cmd $cmd -RequestId $reqId -Error "comando nao permitido: $cmd"
                 return
             }
             try {
-                $extra = @{}
-                if ($Msg.payload) {
-                    foreach ($k in @('id', 'pid', 'option', 'outcome', 'action')) {
-                        if ($Msg.payload.$k) { $extra[$k] = [string]$Msg.payload.$k }
-                    }
+                $json = Invoke-EngineCli -Words (Engine-Args -Cmd $cmd -P $Msg.payload)
+                if ($EngineJsonlCommands -contains $cmd) {
+                    $json = '[' + ((($json -split "`r?`n") | Where-Object { $_.Trim() }) -join ',') + ']'
                 }
-                $result = Invoke-EngineCli -Cmd $cmd -Args $extra
-                Send-ToJs -Type 'engine-reply' -Payload @{ cmd = $cmd; ok = $true; result = $result }
+                Send-EngineReply -Cmd $cmd -RequestId $reqId -ValueJson $json
             }
             catch {
-                Send-ToJs -Type 'engine-reply' -Payload @{
-                    cmd = $cmd; ok = $false; error = $_.Exception.Message }
+                Send-EngineReply -Cmd $cmd -RequestId $reqId -Error $_.Exception.Message
             }
         }
         default {

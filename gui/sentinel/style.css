@@ -120,6 +120,9 @@ a { color: var(--primary-lit); text-underline-offset: 2px; }
 .state-pill .led { width: 6px; height: 6px; border-radius: 99px; background: currentColor; }
 .state-pill.is-live { color: var(--teal); border-color: rgba(45, 217, 185, 0.35); }
 .state-pill.is-dead { color: var(--primary-lit); border-color: rgba(225, 29, 41, 0.4); }
+/* Pausada não é vivo nem parado: o daemon roda e não registra. Merece o
+   terceiro estado (âmbar), senão a pessoa lê "VIVO" e confia no que não veio. */
+.state-pill.is-paused { color: var(--amber); border-color: rgba(251, 191, 91, 0.4); }
 
 .titlebar-phase {
   font-family: var(--font-mono);
@@ -253,6 +256,7 @@ a { color: var(--primary-lit); text-underline-offset: 2px; }
 .hud-v .unit { color: var(--text-faint); font-size: 11.5px; }
 .hud-v.is-live { color: var(--teal); }
 .hud-v.is-dead { color: var(--primary-lit); }
+.hud-v.is-paused { color: var(--amber); }
 
 /* ---------------- medidores ---------------- */
 
@@ -475,7 +479,7 @@ a { color: var(--primary-lit); text-underline-offset: 2px; }
 
 /* ---------------- tutoriais ---------------- */
 
-.tutor-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.tutor-head { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 12px; }
 .tutor-count {
   font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.1em;
   color: var(--text-faint);
@@ -529,6 +533,45 @@ a { color: var(--primary-lit); text-underline-offset: 2px; }
   margin-top: 18px; padding-top: 16px;
   border-top: 1px solid var(--border);
 }
+/* A justificativa do tutorial, no mesmo peso visuais dos passos: o kicker em
+   mono miúdo faz o papel de rótulo de coluna, e o texto em corpo é o que se lê.
+   `is-risk` é a única linha do fluxo com borda quente — risco é a peça que
+   muda a decisão, não mais um parágrafo. */
+.tutor-line {
+  display: grid; grid-template-columns: 148px minmax(0, 1fr);
+  gap: 14px;
+  padding: 9px 0 9px 12px;
+  border-left: 1px solid var(--border-strong);
+  margin-bottom: 4px;
+}
+.tutor-line.is-risk { border-left-color: rgba(225, 29, 41, 0.5); }
+.tutor-k {
+  font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  padding-top: 2px;
+}
+.tutor-t { margin: 0; font-size: 13.5px; color: var(--text-dim); }
+.tutor-line.is-risk .tutor-t { color: var(--text); }
+/* Estado de espera: o motor é um processo filho, então "consultando" é verdade
+   literal — e o ponto que respira diz que a janela não travou. */
+.busy {
+  display: flex; align-items: center; gap: 9px;
+  font-size: 13.5px; color: var(--text-dim);
+}
+.busy-dot {
+  width: 8px; height: 8px; flex: none;
+  border-radius: 99px;
+  background: var(--primary-lit);
+  box-shadow: 0 0 0 0 var(--glow);
+  animation: pulse 1.2s ease-out infinite;
+}
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 var(--glow); opacity: 1; }
+  70% { box-shadow: 0 0 0 7px rgba(179, 18, 27, 0); opacity: 0.65; }
+  100% { box-shadow: 0 0 0 0 rgba(179, 18, 27, 0); opacity: 1; }
+}
+.spark.is-empty .spark-line { opacity: 0.35; }
 .ask-q { font-size: 14px; color: var(--text); font-weight: 600; }
 .tried {
   margin-top: 14px; padding-top: 13px;
@@ -654,6 +697,15 @@ a { color: var(--primary-lit); text-underline-offset: 2px; }
   border-top: 1px solid var(--border);
   background: var(--bg-inset);
 }
+/* O "inclusive os filhos" empurra os botões para a direita e fica onde o olho
+   já está antes de confirmar: é a escolha que muda o alcance da ação. */
+.modal-foot .check {
+  margin-right: auto;
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 12.5px; color: var(--text-dim);
+  cursor: pointer;
+}
+.modal-foot .check input { accent-color: var(--primary); width: 14px; height: 14px; }
 .tree {
   font-family: var(--font-mono); font-size: 11.5px; color: var(--text-faint);
   background: var(--bg-inset);
@@ -681,6 +733,9 @@ a { color: var(--primary-lit); text-underline-offset: 2px; }
 
 @media (prefers-reduced-motion: reduce) {
   .sweep, .ev-row.is-new { animation: none; }
+  /* O ponto que respira some, mas a espera continua ditando o desenho: sem
+     ele o "gravando…" vira tela congelada. */
+  .busy-dot { animation: none; box-shadow: 0 0 0 3px rgba(179, 18, 27, 0.25); }
   .gauge-val { transition: none; }
   * { scroll-behavior: auto; }
 }
