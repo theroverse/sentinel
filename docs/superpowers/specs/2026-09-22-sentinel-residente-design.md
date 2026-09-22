@@ -83,6 +83,22 @@ Regras do índice:
 - Todo sinal entra no evento, para o tutorial poder citar *o que* foi
   medido em vez de dizer "o sistema está lento".
 
+Estado (2026-09-22, D1): os três sinais de gargalo e o culpado em crítico
+sustentado estão implementados em `sentinel/stall.py`, medidos a cada ciclo
+do daemon, com o intervalo encurtado sob suspeita. A **janela pendurada** não
+está: ela abre a sugestão e não o degrau (regra acima), e enumerar janelas por
+PID é o único sinal da tabela que exige ctypes — entra junto de quem a consome
+na fase D2, não antes. A auto-inanição é medida sobre o `sleep()` e não sobre o
+ciclo inteiro, porque dentro do ciclo moram o scan de processos e a consulta ao
+Event Log — trabalho nosso, não fome da máquina.
+
+Medida nesta máquina, e ela muda a leitura do sinal: no Windows o psutil
+devolve `sin`/`sout` **zerados** (a própria documentação diz que ali eles não
+significam nada). Ou seja, `thrashing` é carregado pelo percentual de carga de
+commit, que no Windows é o `swap_memory().percent`; a taxa só conta em Linux. É
+por isso que o tutorial de `stall` cita a carga medida e nunca uma taxa que,
+aqui, seria "0".
+
 ## 5. Escada de ação, e quem autoriza o quê
 
 A decisão não passa pela GUI porque, no cenário que você descreveu, a GUI
@@ -374,15 +390,19 @@ vigilância.
   `sentinel model setup` (o provisionamento saiu, seção 10).
 - **daemon**: árvore por ciclo, índice de stall, executor de degraus,
   leitura do `paused`, prioridade própria alta. Roda como usuário comum.
+  Estado: `paused` lido (fase C) e índice de stall medindo, com intervalo
+  próprio encurtado sob suspeita (D1). Faltam o executor de degraus e o
+  auto-boost de prioridade (D2).
 - **`SentinelHost.ps1`**: o prompt `YesNo` de reabrir como administrador
   (linhas 130–146) sai. Fica a detecção de `IsAdmin`, só que reorientada:
   ela alimenta a declaração de alcance da seção 5, não um convite à
   elevação. A bandeja (`SentinelTray.ps1`) nasce sem qualquer
   `-Verb RunAs`.
-- **events**: tipos novos (`app_failure`, `orphan_tree`, `relief_applied`),
-  schema 2. A linha de incidente **não** tem `value`/`threshold`: tem
-  `label` (uma frase, pro log e pro CLI) e `detail` (o mapa da árvore, ou o
-  módulo + código de exceção da queda). Nem uma nem outra se disfarçam de
+- **events**: tipos novos (`app_failure`, `orphan_tree`, `stall`,
+  `relief_applied`), schema 2. A linha de incidente **não** tem
+  `value`/`threshold`: tem `label` (uma frase, pro log e pro CLI) e
+  `detail` (o mapa da árvore, o módulo + código de exceção da queda, ou os
+  números medidos pelo índice de stall). Nem uma nem outra se disfarçam de
   limiar com zero preenchido.
 - **daemon.log**: linha `ANOMALIA <metric> <sev> occ=N status=... id=... ::
   <label>` — o `:: <label>` no fim mantém os pares `chave=valor`
@@ -402,7 +422,7 @@ vigilância.
 | A | ✔ falha de app + órfão + schema 2 + testes | nenhum (só lê) |
 | B | ✔ `kb.db`, formato assertivo, reescrita do conteúdo, ranking | nenhum |
 | C | ✔ pause/resume em arquivo (a bandeja e o toast saíram — 13.1) | baixo |
-| D | stall index + degrau 1 **já ligado** + guardas (rate limit, cooldown, `paused`) + chave de modo sombra | médio |
+| D | **D1 entregue** (2026-09-22): índice de stall medindo no daemon — auto-inanição, thrash e disco saturado, combinados com culpado em crítico sustentado; evento próprio `stall` com os números medidos; intervalo encurtado 2,0 s → 0,5 s sob suspeita; `swap_percent`/`swap_activity_ps` na `Sample` e no batimento; catálogo curado da métrica (3 opções, nenhuma com `action`) com a prova montada só com o que o episódio mediu, e o `culprit` como assinatura de causa na camada 2 da base. **Resta D2**: degrau 1 **já ligado** + guardas (rate limit, cooldown, `paused`) + chave de modo sombra | médio |
 | E | degraus 2 e 3, ordens permanentes por crachá, teto por job | **alto — precisa da sua revisão das guardas** |
 | F | ✔ `local_model.py` (sonda + dois dialetos, veto de loopback) e `model status`; o `setup` saiu (13.1). Restam as vistas novas da GUI | baixo (nenhuma instalação, nenhuma inferência no daemon) |
 

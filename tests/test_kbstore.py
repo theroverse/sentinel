@@ -6,6 +6,7 @@ from sentinel import kb, kbstore, settings
 from sentinel.detector import METRIC_CPU, METRIC_RAM
 from sentinel.events import OUTCOME_FIXED, OUTCOME_NOT_FIXED
 from sentinel.incidents import METRIC_APP_FAILURE, METRIC_ORPHAN_TREE
+from sentinel.stall import METRIC_STALL
 
 
 _TOKEN_RE = re.compile(r"\{[a-z_]+\}")
@@ -85,7 +86,35 @@ def _event_for(metric):
         return _crash()
     if metric == METRIC_ORPHAN_TREE:
         return _orphan()
+    if metric == METRIC_STALL:
+        return _stall_event()
     return _finding(metric=metric)
+
+
+def _stall_event(name="chrome"):
+    return {
+        "id": "evt-stall",
+        "schema": 2,
+        "kind": "anomaly",
+        "metric": METRIC_STALL,
+        "severity": "critical",
+        "label": f"estagnacao: {name} em critico (ram) com o proprio daemon "
+                 "nao escalado no tempo pedido",
+        "detail": {
+            "signals": ["starved", "thrashing"],
+            "culprit": {"name": name, "pid": 4321, "metric": "ram"},
+            "measured": {
+                "sleep_s": 5.0,
+                "interval_s": 2.0,
+                "swap_percent": 93.0,
+                "swap_activity_ps": 0.0,
+                "io_busy_percent": 12.0,
+            },
+        },
+        "status": "open",
+        "fingerprint": f"stall:critical:{name}",
+        "occurrences": 1,
+    }
 
 
 def _learned(title="Fecha as abas presas do chrome"):
@@ -213,6 +242,24 @@ def test_incident_cause_is_the_module_not_the_process(tmp_path):
         options, layer = db.lookup(_crash(app="jogo.exe"))
     assert layer == kbstore.LAYER_CAUSE
     assert options and layer != kbstore.LAYER_METRIC
+
+
+def test_stall_cause_is_the_culprit_the_index_sustained(tmp_path):
+    """O `culprit` do indice e a causa: ele ja passou por dois batimentos em
+    critico antes de o episodio abrir, entao a base pode aprender com o nome
+    e servir na vez seguinte, com outro severity."""
+    assert kbstore.cause_of(_stall_event("chrome")) == "chrome"
+    with kbstore.open_store(tmp_path / "kb.db") as db:
+        db.learn(_stall_event("chrome"), _learned("Rebaixa o chrome no PowerShell"),
+                 source=kbstore.LAYER_MODEL)
+        other = _stall_event("chrome")
+        other["severity"] = "warning"
+        other["fingerprint"] = "stall:warning:chrome"
+        options, layer = db.lookup(other)
+    assert layer == kbstore.LAYER_CAUSE
+    assert options[0]["title"] == "Rebaixa o chrome no PowerShell"
+    # A leitura preenche com os tokens, nao com o texto de origem.
+    assert "{" not in options[0]["steps"][0]
 
 
 def test_learn_is_idempotent(tmp_path):

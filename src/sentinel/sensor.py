@@ -36,6 +36,13 @@ class Sample:
     io_busy_percent: float
     net_recv_bps: float
     net_sent_bps: float
+    # Paginacao. `swap_percent` no Windows e o pagefile, e o percentual dele
+    # E a carga de commit; `swap_activity_ps` e a taxa de paginas (ou KB, no
+    # Linux) trocadas por segundo desde a amostra anterior. Defaults 0.0 pra
+    # Sample continuar construivel por quem nao mede troca (testes, outras
+    # fontes de amostra) sem preencher campo de proposito.
+    swap_percent: float = 0.0
+    swap_activity_ps: float = 0.0
     top_cpu: list[ProcessInfo] = field(default_factory=list)
     top_mem: list[ProcessInfo] = field(default_factory=list)
 
@@ -68,6 +75,7 @@ class Sensor:
         self._ps = psutil_module
         self._prev_net: tuple[float, float, float] | None = None  # (ts, sent, recv)
         self._prev_disk: tuple[float, float] | None = None  # (ts, busy_ms)
+        self._prev_swap: tuple[float, float] | None = None  # (ts, sin+sout)
         # Primeira leitura nao-bloqueante de cpu_percent "arma" o contador
         # interno do psutil; descarta o 0.0 resultante.
         self._ps.cpu_percent(interval=None)
@@ -85,6 +93,7 @@ class Sensor:
         disk_percent = float(du.percent)
 
         io_busy, net_recv_bps, net_sent_bps = self._rates(now_mono, ps)
+        swap_percent, swap_activity_ps = self._swap(now_mono, ps)
 
         top_cpu = self.top_processes(sort="cpu") if top else []
         top_mem = self.top_processes(sort="mem") if top else []
@@ -98,6 +107,8 @@ class Sensor:
             io_busy_percent=io_busy,
             net_recv_bps=net_recv_bps,
             net_sent_bps=net_sent_bps,
+            swap_percent=swap_percent,
+            swap_activity_ps=swap_activity_ps,
             top_cpu=top_cpu,
             top_mem=top_mem,
         )
@@ -164,6 +175,47 @@ class Sensor:
             self._prev_disk = cur
 
         return io_busy, max(0.0, recv_bps), max(0.0, sent_bps)
+
+    def _swap(self, now_mono: float, ps) -> tuple[float, float]:
+        """Percentual de troca e taxa de paginas trocadas por segundo.
+
+        No Windows, `swap_memory()` le o pagefile e `.percent` e a carga de
+        commit (usado / limite) — por isso nao ha ctypes nenhum aqui: o
+        numero que o `GlobalMemoryStatusEx` daria ja vem do psutil.
+
+        `sin`/`sout` sao cumulativos, entao a taxa e delta sobre o tempo da
+        chamada anterior, como em `_rates`. A unidade segue a plataforma e a
+        taxa so entra em limiar configuravel, nunca em numero absoluto. No
+        Windows os dois contadores vem zerados (o psutil documenta que la
+        eles nao significam nada), entao a taxa fica em 0.0 e o sinal de
+        paginacao e carregado pelo `percent` acima.
+
+        Maquina sem pagefile (Linux sem swap) devolve `(0.0, 0.0)`: ausencia
+        de medida nao e estagnacao.
+        """
+        try:
+            swap = ps.swap_memory()
+        except Exception:  # psutil pode negar swap em ambientes estranhos
+            return 0.0, 0.0
+
+        if swap is None:
+            return 0.0, 0.0
+
+        percent = float(getattr(swap, "percent", 0.0) or 0.0)
+        moved = float(getattr(swap, "sin", 0.0) or 0.0) + float(
+            getattr(swap, "sout", 0.0) or 0.0
+        )
+
+        rate = 0.0
+        cur = (now_mono, moved)
+        if self._prev_swap is not None:
+            dt = cur[0] - self._prev_swap[0]
+            if dt > 0:
+                # Contador zera quando o SO reinicia: delta negativo e
+                # reescala, nao trafego. 0.0 preserva o sinal "sem medida".
+                rate = max(0.0, (cur[1] - self._prev_swap[1]) / dt)
+        self._prev_swap = cur
+        return percent, rate
 
     def top_processes(self, sort: str = "cpu", n: int | None = None) -> list[ProcessInfo]:
         """Os `n` processos mais caros por `sort` ('cpu' ou 'mem').

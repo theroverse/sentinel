@@ -345,15 +345,20 @@ const SENTINEL_MOCK = {
   ],
 
   // linhas do daemon.log, na ordem e no formato exatos que daemon.py escreve
-  // (_heartbeat: "tick cpu=..."; _persist: "ANOMALIA <metric> <sev> value=
-  // <v> thr=<t> status=<s> id=<id>"). Resolucoes nao passam por aqui: vao
-  // para events.jsonl.
+  // (_heartbeat: "tick cpu=... swap=<%> swap_rate=<pag/s>", com stall=1 quando
+  // o indice de estagnacao esta em episodio; _persist: "ANOMALIA <metric>
+  // <sev> value= <v> thr=<t> status=<s> id=<id>"; _persist_incident: "ANOMALIA
+  // <metric> <sev> occ=N status=<s> id=<id> :: <label>"; _log_stall_clear:
+  // "ESTAGNACAO CESSOU dur=.. ticks=.. sinais=.."). Resolucoes nao passam por
+  // aqui: vao para events.jsonl.
   log: [
-    { ts: "2026-09-22T10:42:07+00:00", text: "tick cpu=38.4 ram=76.1 disk=88.2 io=11.7 net_down_bps=412000 net_up_bps=68400" },
-    { ts: "2026-09-22T10:42:05+00:00", text: "tick cpu=41.2 ram=76.0 disk=88.2 io=9.4 net_down_bps=388000 net_up_bps=61200" },
-    { ts: "2026-09-22T10:42:03+00:00", text: "tick cpu=37.8 ram=75.9 disk=88.2 io=8.1 net_down_bps=126000 net_up_bps=40400" },
+    { ts: "2026-09-22T10:42:07+00:00", text: "tick cpu=38.4 ram=76.1 disk=88.2 io=11.7 swap=6.6 swap_rate=0 net_down_bps=412000 net_up_bps=68400" },
+    { ts: "2026-09-22T10:42:05+00:00", text: "tick cpu=41.2 ram=76.0 disk=88.2 io=9.4 swap=6.6 swap_rate=118 net_down_bps=388000 net_up_bps=61200" },
+    { ts: "2026-09-22T10:42:03+00:00", text: "tick cpu=37.8 ram=75.9 disk=88.2 io=8.1 swap=6.5 swap_rate=0 net_down_bps=126000 net_up_bps=40400" },
     { ts: "2026-09-22T10:39:11+00:00", text: "ANOMALIA disk warning value=88.2 thr=85.0 status=open id=evt-20260922-103911-4f21" },
+    { ts: "2026-09-22T10:12:58+00:00", text: "ESTAGNACAO CESSOU dur=27.0s ticks=54 sinais=starved, thrashing" },
     { ts: "2026-09-22T10:12:44+00:00", text: "ANOMALIA cpu critical value=96.4 thr=95.0 status=open id=evt-20260922-101244-9a31" },
+    { ts: "2026-09-22T10:12:31+00:00", text: "ANOMALIA stall critical occ=1 status=open id=evt-20260922-101231-7bd0 :: estagnacao: code.exe em critico (cpu) com o proprio daemon nao foi escalado no tempo pedido, paginacao em ritmo de gargalo" },
     { ts: "2026-09-22T08:41:02+00:00", text: "ANOMALIA ram warning value=82.7 thr=80.0 status=open id=evt-20260922-084102-1c77" },
   ],
 

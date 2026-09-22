@@ -29,6 +29,13 @@ class _Net:
         self.bytes_recv = recv
 
 
+class _Swap:
+    def __init__(self, percent: float, sin: int, sout: int):
+        self.percent = percent
+        self.sin = sin
+        self.sout = sout
+
+
 class _DiskIO:
     def __init__(self, read_time: float, write_time: float):
         self.read_time = read_time
@@ -125,6 +132,7 @@ class FakePsutil:
         disk_percent=0.0,
         net=(0, 0),
         disk_io=(0.0, 0.0),
+        swap=(0.0, 0, 0),
         processes=None,
         partitions=None,
     ):
@@ -133,6 +141,9 @@ class FakePsutil:
         self._disk_percent = disk_percent
         self._net = net
         self._disk_io = disk_io
+        # (percent, sin, sout): `sin`/`sout` sao cumulativos no psutil real,
+        # entao um teste que queira taxa muda os dois entre chamadas.
+        self._swap = swap
         self._processes = processes or []
         self._partitions = partitions or [
             _Part("C:", "C:\\"),
@@ -155,6 +166,9 @@ class FakePsutil:
 
     def disk_io_counters(self) -> _DiskIO:
         return _DiskIO(*self._disk_io)
+
+    def swap_memory(self) -> _Swap:
+        return _Swap(*self._swap)
 
     def process_iter(self, attrs=None):
         return list(self._processes)
@@ -190,11 +204,15 @@ def make_sample(
     io: float = 0.0,
     net_recv: float = 0.0,
     net_sent: float = 0.0,
+    swap: float = 0.0,
+    swap_rate: float = 0.0,
     top_cpu=None,
     top_mem=None,
     ts: datetime.datetime | None = None,
 ) -> Sample:
-    """Fabrica de Sample pra testes de detector/tutor/events (sem psutil)."""
+    """Fabrica de Sample pra testes de detector/tutor/events/stall (sem
+    psutil). `swap` e o percentual de paginacao, `swap_rate` a taxa por
+    segundo — os dois numeros crus que o indice de estagnacao le."""
     return Sample(
         ts=ts or datetime.datetime(2026, 9, 21, 12, 0, 0, tzinfo=datetime.timezone.utc),
         cpu_percent=cpu,
@@ -204,6 +222,8 @@ def make_sample(
         io_busy_percent=io,
         net_recv_bps=net_recv,
         net_sent_bps=net_sent,
+        swap_percent=swap,
+        swap_activity_ps=swap_rate,
         top_cpu=top_cpu or [],
         top_mem=top_mem or [],
     )

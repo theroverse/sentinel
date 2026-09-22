@@ -97,6 +97,11 @@ def cause_of(event: dict) -> str:
     if metric == kb.METRIC_ORPHAN_TREE:
         return str(detail.get("parent", {}).get("name") or "").strip().lower()
 
+    if metric == kb.METRIC_STALL:
+        # O indice ja sustentou o nome por dois batimentos antes de abrir o
+        # episodio: aqui a causa nao e chute, e a medida.
+        return str((detail.get("culprit") or {}).get("name") or "").strip().lower()
+
     top = event.get("top_processes") or []
     if top:
         return str(top[0].get("name") or "").strip().lower()

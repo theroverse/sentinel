@@ -169,6 +169,48 @@ mesmo histórico, com o mesmo dedupe e o mesmo ciclo de `fix`:
 Nenhum dos dois oferece `kill_top_process` automático: um incidente não tem
 "processo mais caro", e a decisão é sempre sua.
 
+### Quando a máquina trava: o índice de estagnação (`stall`)
+
+Recurso alto não é prova de nada — build rodando a 99% de CPU é build
+rodando. O que muda o diagnóstico é o **atraso que a máquina passa a ter pra
+si mesma**, e isso o Sentinel mede a cada batimento com três sinais locais:
+
+| sinal | o que é medido | por que é travamento |
+| --- | --- | --- |
+| `starved` | quanto o `sleep(2,0)` do daemon **realmente** demorou | se a máquina não escala nem quem só dorme, nada mais é escalado |
+| `thrashing` | carga de commit (no Windows, o `percent` do pagefile **é** o commit) e, onde o psutil mede, páginas trocadas por segundo | o paginador virou o gargalo; a 90% do limite o Windows já recorda reserva |
+| `disk_saturated` | `%` de tempo do disco ocupado com I/O, sustentado | todo mundo esperando disco |
+
+A regra é de **combinação**, e é ela que evita o falso-positivo: estagnação
+é (qualquer um dos três) **e** pelo menos um processo candidato em crítico
+sustentado — o mesmo processo, pelo nome, em dois batimentos seguidos.
+Pressão sem culpado é clima; crítico sem pressão é carga de trabalho pedida.
+Processo protegido (`svchost`, `csrss`, ...) e o próprio Sentinel nunca são
+candidatos.
+
+O que o índice faz com o loop, e só isso:
+
+- **encurta o próprio intervalo** de 2,0 s para 0,5 s enquanto há suspeita,
+  pra ver o episódio passar por dentro e saber a hora exata em que acabou;
+- **grava um evento por episódio** (não por tick), com os números medidos
+  dentro do `detail` — é o que permite ao tutorial citar "o sleep de 2 s do
+  daemon levou 6.1 s" em vez de dizer "o sistema está lento";
+- marca o batimento com `stall=1` e, no fim, escreve
+  `ESTAGNACAO CESSOU dur=… ticks=… sinais=…` no `daemon.log`.
+
+Ele **não age**: mexer no sistema é o degrau 1 (`relief`), que lê o que esta
+medição produziu. Sob `pause`, o índice continua medindo e o intervalo
+continua encurtando, mas nenhuma linha vai pro histórico.
+
+O catálogo curado da métrica tem três opções, nenhuma com `action` automática
+(o `fix` apresenta e você executa): rebaixar a prioridade do culpado no
+PowerShell da sua sessão, sem admin e sem fechar nada; ceder working set
+fechando janelas quando o sinal que abriu o episódio foi a paginação; e
+procurar recorrência no mesmo relógio, que é o que separa carga de trabalho
+de tarefa agendada. A frase de prova (`{evidence}`) é montada **só** com os
+números daquele episódio — no Windows, onde o psutil devolve `sin`/`sout`
+zerados, ela cita a carga de commit em vez de uma taxa que seria "0".
+
 ### A base de conhecimento local (`.sentinel/kb.db`)
 
 `fix` não pergunta primeiro a um modelo: pergunta à sua própria história. A
@@ -283,6 +325,22 @@ Rede **não** tem crítico: banda alta é contexto, não falha. Ajuste tudo
 por `.sentinel/config.json` (ex.: `{"CPU_WARNING": 90}`) — o `sentinel
 config --show-source` mostra o que foi sobrescrito.
 
+Os sinais do índice de estagnação têm limiares próprios, e obedecem à mesma
+regra de sobrescrita:
+
+| Sinal | Limiar | Sustentação |
+| --- | --- | --- |
+| `starved` | `sleep` real ≥ 2× o pedido | 2 batimentos |
+| `thrashing` | taxa de troca (`sin`+`sout`) ≥ 256/s **ou** commit ≥ 90% | 2 batimentos |
+| `disk_saturated` | disco ocupado ≥ 95% | 3 batimentos |
+| culpado em crítico | 1 processo elegível | 2 batimentos |
+| intervalo sob suspeita | 2,0 s → **0,5 s** | enquanto durar |
+
+No Windows o `thrashing` é carregado pelo **commit**: o psutil documenta que
+`sin`/`sout` ali "não significam nada e ficam em 0" (medido: `sin=0
+sout=0`), então a taxa só conta em Linux — onde a unidade segue o psutil da
+plataforma, e por isso o número é configurável e não absoluto.
+
 ## Formato do evento (`.sentinel/events.jsonl`)
 
 Append-only, uma linha = um JSON. Dois tipos: `anomaly` e `resolution`
@@ -335,9 +393,10 @@ sentinel/
 ├── src/sentinel/
 │   ├── cli.py              # argparse + despacho de comandos
 │   ├── settings.py         # limiares, paths do .sentinel/, lista protegida
-│   ├── sensor.py           # psutil → Sample (CPU/RAM/disco/rede/top procs)
+│   ├── sensor.py           # psutil → Sample (CPU/RAM/disco/rede/troca/top procs)
 │   ├── daemon.py           # start/stop/status + loop de vigilância
 │   ├── detector.py         # regras sustained → Findings
+│   ├── stall.py            # índice de estagnação (starved/thrashing/disco)
 │   ├── incidents.py        # fotografia da árvore → Incident (órfãos)
 │   ├── appfail.py          # Event Log (wevtutil /f:xml) → Incident
 │   ├── events.py           # EventStore JSONL (append + dedupe + resolução)

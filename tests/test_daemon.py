@@ -300,3 +300,211 @@ class _SilentSource:
     def observe(self, now=None):
         self.calls += 1
         return []
+
+
+# -- estagnacao: o loop medindo, encurtando e registrando ------------------
+
+
+class ScriptedSensor:
+    """Amostras em ordem; a ultima se repete quando a fila acaba, pra o loop
+    poder rodar mais ticks do que itens."""
+
+    def __init__(self, samples):
+        self._samples = list(samples)
+
+    def sample(self, *, top=True):
+        if len(self._samples) > 1:
+            return self._samples.pop(0)
+        return self._samples[0]
+
+
+class SlowSleep:
+    """`sleep` que cobra caro: a maquina nao escalou o daemon no tempo pedido.
+
+    `over` e o fator de esticada (3.0 = pedir 2,0 s e acordar 6,0 s depois); o
+    par `sleep`/`clock` devolve exatamente isso ao loop como duracao real do
+    cochilo. `flip_after` sao os cochilos depois dos quais a maquina volta a
+    respirar — e como fechar um episodio sem esperar relogio de verdade.
+    `asked` guarda o intervalo que o loop pediu em cada volta.
+    """
+
+    def __init__(self, *, over: float = 3.0, flip_after: int | None = None):
+        self.over = over
+        self.flip_after = flip_after
+        self.now = 0.0
+        self.asked: list = []
+
+    def sleep(self, seconds):
+        self.asked.append(seconds)
+        self.now += seconds * self.over
+        if self.flip_after is not None and len(self.asked) >= self.flip_after:
+            self.over = 1.0
+
+    def clock(self) -> float:
+        return self.now
+
+
+def hot_ticks(n, *, swap_rate=400.0):
+    """`n` ciclos de maquina paginando, com um culpado no topo da RAM."""
+    return [
+        make_sample(
+            cpu=99.0,
+            ram=97.0,
+            disk=50.0,
+            io=10.0,
+            swap_rate=swap_rate,
+            top_cpu=[proc(1, "burn")],
+            top_mem=[proc(1, "burn")],
+        )
+        for _ in range(n)
+    ]
+
+
+def cool_ticks(n):
+    return hot_ticks(n, swap_rate=0.0)
+
+
+def test_run_watch_loop_records_the_stall_incident(tmp_path):
+    """O travamento vira linha no historico, com os numeros medidos dentro.
+
+    CPU em 99% sozinho ja e gravado (fase anterior); aqui entra o segundo
+    tipo de evidencia — o daemon pedindo 2 s e acordando 6 s depois.
+    """
+    paths = settings.paths_for(tmp_path)
+    store = EventStore(paths.events)
+    sleeper = SlowSleep(over=3.0)
+
+    daemon.run_watch_loop(
+        paths,
+        sensor=ScriptedSensor(hot_ticks(24)),
+        store=store,
+        sleep=sleeper.sleep,
+        clock=sleeper.clock,
+        interval=settings.SAMPLE_INTERVAL_S,
+        stop_after=20,
+    )
+
+    stalls = [a for a in store.anomalies() if a["metric"] == "stall"]
+    assert len(stalls) == 1, "o episodio deve ser UMA linha, nao um tick por linha"
+    event = stalls[0]
+    assert event["severity"] == "critical"
+    assert "starved" in event["detail"]["signals"]
+    assert event["detail"]["culprit"]["name"] == "burn"
+    measured = event["detail"]["measured"]
+    assert measured["sleep_s"] >= measured["interval_s"] * settings.STALL_STARVE_FACTOR
+    log = paths.daemon_log.read_text(encoding="utf-8")
+    assert "ANOMALIA stall critical" in log
+
+
+def test_run_watch_loop_samples_faster_while_stalled(tmp_path):
+    """Spec 4: sob suspeita o daemon encurta o proprio intervalo — e a unica
+    maneira de saber a hora em que o episodio acabou."""
+    paths = settings.paths_for(tmp_path)
+    sleeper = SlowSleep(over=3.0)
+
+    daemon.run_watch_loop(
+        paths,
+        sensor=ScriptedSensor(hot_ticks(24)),
+        store=EventStore(paths.events),
+        sleep=sleeper.sleep,
+        clock=sleeper.clock,
+        interval=settings.SAMPLE_INTERVAL_S,
+        stop_after=20,
+    )
+
+    assert sleeper.asked[0] == settings.SAMPLE_INTERVAL_S
+    assert settings.SAMPLE_INTERVAL_FAST_S in sleeper.asked, \
+        "o intervalo nunca encurtou durante o travamento"
+
+
+def test_run_watch_loop_goes_back_to_the_normal_interval(tmp_path):
+    """Voltar ao intervalo normal nao e detalhe de performance: a 0,5 s para
+    sempre, o daemon vira o processo mais caro da maquina que ele vigia."""
+    paths = settings.paths_for(tmp_path)
+    sleeper = SlowSleep(over=3.0, flip_after=2)
+
+    daemon.run_watch_loop(
+        paths,
+        sensor=ScriptedSensor(hot_ticks(12) + cool_ticks(20)),
+        store=EventStore(paths.events),
+        sleep=sleeper.sleep,
+        clock=sleeper.clock,
+        interval=settings.SAMPLE_INTERVAL_S,
+        stop_after=28,
+    )
+
+    assert sleeper.asked[-1] == settings.SAMPLE_INTERVAL_S
+    log = paths.daemon_log.read_text(encoding="utf-8")
+    assert "ESTAGNACAO CESSOU" in log
+    assert "dur=" in log
+
+
+def test_run_watch_loop_marks_the_heartbeat(tmp_path):
+    paths = settings.paths_for(tmp_path)
+    sleeper = SlowSleep(over=3.0)
+
+    daemon.run_watch_loop(
+        paths,
+        sensor=ScriptedSensor(hot_ticks(24)),
+        store=EventStore(paths.events),
+        sleep=sleeper.sleep,
+        clock=sleeper.clock,
+        interval=settings.SAMPLE_INTERVAL_S,
+        stop_after=20,
+    )
+
+    log = paths.daemon_log.read_text(encoding="utf-8")
+    assert "swap=0.0" in log, "a taxa/percentual de paginacao nao aparece no tick"
+    assert "swap_rate=400" in log
+    assert "stall=1" in log, "o batimento nao diz que estavamos travados"
+
+
+def test_paused_loop_records_no_stall_incident(tmp_path):
+    """Pausado e mudo tambem para o indice: o episodio acontece (o intervalo
+    ate encurta), mas nenhuma linha nova vai para o historico."""
+    paths = settings.paths_for(tmp_path)
+    store = EventStore(paths.events)
+    daemon.pause(paths)
+    sleeper = SlowSleep(over=3.0)
+
+    daemon.run_watch_loop(
+        paths,
+        sensor=ScriptedSensor(hot_ticks(24)),
+        store=store,
+        sleep=sleeper.sleep,
+        clock=sleeper.clock,
+        interval=settings.SAMPLE_INTERVAL_S,
+        stop_after=20,
+    )
+
+    assert store.anomalies() == []
+    log = paths.daemon_log.read_text(encoding="utf-8")
+    assert "ANOMALIA" not in log
+    assert settings.SAMPLE_INTERVAL_FAST_S in sleeper.asked
+
+
+def test_broken_stall_monitor_does_not_stop_sampling(tmp_path):
+    """Indice de estagnacao e vigilancia extra: se ele estourar, a amostra de
+    CPU e o batimento seguem — como nos outros monitores."""
+    paths = settings.paths_for(tmp_path)
+    store = EventStore(paths.events)
+
+    class ExplodingStall:
+        def observe(self, *a, **kw):
+            raise RuntimeError("indice quebrado")
+
+        suspect = False
+        stalled = False
+        closed = None
+
+    ticks = daemon.run_watch_loop(
+        paths,
+        sensor=FakeSensor(),
+        store=store,
+        stall=ExplodingStall(),
+        sleep=lambda _s: None,
+        stop_after=settings.MIN_SAMPLES_BEFORE_DETECT + 5,
+    )
+
+    assert ticks == settings.MIN_SAMPLES_BEFORE_DETECT + 5
+    assert any(a["metric"] == "cpu" for a in store.anomalies())

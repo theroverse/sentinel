@@ -12,6 +12,7 @@ from sentinel import settings
 from sentinel.detector import Detector, Finding
 from sentinel.events import EventStore
 from sentinel.sensor import Sensor, Sample
+from sentinel.stall import StallMonitor
 
 
 class AlreadyRunning(RuntimeError):
@@ -277,8 +278,10 @@ def run_watch_loop(
     store: EventStore | None = None,
     detector: Detector | None = None,
     incident_sources: list | None = None,
+    stall: StallMonitor | None = None,
     interval: float | None = None,
     sleep=time.sleep,
+    clock=time.monotonic,
     stop_after: int | None = None,
     on_sample=None,
 ) -> int:
@@ -295,6 +298,16 @@ def run_watch_loop(
     nunca abre processo filho nem lê o Event Log por conta propria num
     contexto de teste.
 
+    `stall` mede a estagnacao a cada ciclo e faz duas coisas com o loop:
+    encurta o proprio intervalo sob suspeita (`SAMPLE_INTERVAL_FAST_S`) e
+    entrega o incidente do episodio quando ele abre. Roda mesmo sem os
+    monitores de incidente — e so aritmetica sobre o que ja foi amostrado.
+
+    `clock` mede quanto o `sleep(interval)` *realmente* demorou; e dai que
+    sai o sinal de auto-inanição. O padrao e `time.monotonic`, e um teste
+    que injeta `sleep` falso continua deterministico: dormir de mentirinha
+    nao atrasa nada.
+
     Pausado (`.sentinel/paused`) e mudo, nao fila: o sensor continua
     amostrando e os monitores continuam consumindo o proprio estado — a
     diferenca entre um processo vivo e um morto so existe naquele par de
@@ -310,6 +323,7 @@ def run_watch_loop(
 
     overrides = settings.load_overrides(paths)
     detector.overrides = overrides
+    stall = stall or StallMonitor(overrides=overrides)
 
     store.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -317,6 +331,10 @@ def run_watch_loop(
     # None no primeiro tick: o estado e gravado no log mesmo sem transicao,
     # pra um buraco no historico nunca comecar sem explicacao.
     was_paused: bool | None = None
+    # Duracao real do ultimo `sleep`, e o intervalo pedido antes dele. O
+    # primeiro ciclo nao tem historico de sono — nem sinal de inanicao.
+    last_sleep_s: float | None = None
+    current = interval
     try:
         while True:
             sample = sensor.sample()
@@ -328,18 +346,36 @@ def run_watch_loop(
             incidents: list = []
             for source in sources:
                 incidents.extend(_observe_incidents(source, sample))
+            incidents.extend(
+                _observe_stall(
+                    stall,
+                    sample,
+                    findings,
+                    sleep_s=last_sleep_s,
+                    interval_s=current,
+                )
+            )
             if not paused:
                 for finding in findings:
                     _persist(store, paths, finding, sample)
                 for incident in incidents:
                     _persist_incident(store, paths, incident, sample)
-            _heartbeat(paths, sample, paused=paused)
+            if stall.closed is not None:
+                _log_stall_clear(paths, sample, stall.closed)
+            _heartbeat(paths, sample, paused=paused, stalled=stall.stalled)
             if on_sample is not None:
                 on_sample(sample, findings)
             ticks += 1
             if stop_after is not None and ticks >= stop_after:
                 return ticks
-            sleep(interval)
+            current = (
+                settings.SAMPLE_INTERVAL_FAST_S
+                if stall.suspect
+                else interval
+            )
+            before = clock()
+            sleep(current)
+            last_sleep_s = clock() - before
     except (KeyboardInterrupt, SystemExit):
         return ticks
 
@@ -367,6 +403,45 @@ def _observe_incidents(source, sample: Sample) -> list:
         return []
 
 
+def _observe_stall(
+    stall: StallMonitor,
+    sample: Sample,
+    findings: list,
+    *,
+    sleep_s: float | None,
+    interval_s: float | None,
+) -> list:
+    """Indice de estagnacao, protegido igual aos outros monitores.
+
+    O `observe()` do stall nao faz I/O, mas recebe `Finding`s de fora e um
+    dia desses recebe tambem a janela pendurada (ctypes): uma excecao ali
+    nao pode custar a amostragem de CPU, que e o motivo do loop existir.
+    """
+    try:
+        return list(
+            stall.observe(sample, findings, sleep_s=sleep_s, interval_s=interval_s)
+        )
+    except Exception:
+        return []
+
+
+def _log_stall_clear(paths: settings.Paths, sample: Sample, episode: dict) -> None:
+    """Fim do episodio, com a duracao e os sinais que o abriram.
+
+    Sem esta linha, o historico mostra uma anomalia `stall` e nada que diga
+    quando ela parou — e 'parou sozinho ou eu que resolvi?' e exatamente a
+    pergunta que decide se o degrau 1 merece existir (fase D2).
+    """
+    duration = episode.get("duration_s")
+    spent = "?" if duration is None else f"{duration:.1f}s"
+    signals = ", ".join(episode.get("signals") or ()) or "-"
+    _append_daemon_line(
+        paths,
+        f"{_iso(sample.ts)} ESTAGNACAO CESSOU dur={spent} "
+        f"ticks={episode.get('ticks', 0)} sinais={signals}",
+    )
+
+
 def _persist_incident(
     store: EventStore, paths: settings.Paths, incident, sample: Sample
 ) -> None:
@@ -390,13 +465,19 @@ def _persist(store: EventStore, paths: settings.Paths, finding: Finding, sample:
 
 
 def _heartbeat(
-    paths: settings.Paths, sample: Sample, *, paused: bool = False
+    paths: settings.Paths,
+    sample: Sample,
+    *,
+    paused: bool = False,
+    stalled: bool = False,
 ) -> None:
     flag = " paused=1" if paused else ""
+    flag += " stall=1" if stalled else ""
     line = (
         f"{_iso(sample.ts)} tick cpu={sample.cpu_percent:.1f} "
         f"ram={sample.ram_percent:.1f} disk={sample.disk_percent:.1f} "
         f"io={sample.io_busy_percent:.1f} "
+        f"swap={sample.swap_percent:.1f} swap_rate={sample.swap_activity_ps:.0f} "
         f"net_down_bps={sample.net_recv_bps:.0f} net_up_bps={sample.net_sent_bps:.0f}"
         f"{flag}"
     )

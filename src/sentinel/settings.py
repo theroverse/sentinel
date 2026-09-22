@@ -44,9 +44,9 @@ KB_SCHEMA_VERSION = 1
 # (nao so no nome do arquivo) pra permitir migracao futura sem quebrar
 # leituras antigas.
 #
-# v2: anomalias que nao nascem de limiar (`orphan_tree`, `app_failure`)
-# passam a existir no mesmo arquivo, com `label` + `detail` no lugar de
-# `value`/`threshold`. O leitor e tolerante por construcao (tudo via
+# v2: anomalias que nao nascem de limiar (`orphan_tree`, `app_failure`,
+# `stall`) passam a existir no mesmo arquivo, com `label` + `detail` no lugar
+# de `value`/`threshold`. O leitor e tolerante por construcao (tudo via
 # `.get()`), entao as linhas v1 ja em disco continuam legiveis e o
 # historico nao e reescrito — campo novo nunca quebrar arquivo velho.
 EVENT_SCHEMA_VERSION = 2
@@ -109,6 +109,63 @@ NET_SUSTAINED = 3
 # Quantas amostras recentes o detector mantem pra estimar o p95 de rede
 # usado como referencia relativa (NET_WARNING_RATIO * p95).
 NET_BASELINE_WINDOW = 120
+
+# --------------------------------------------------------------------------
+# Indice de estagnacao ("stall"): a maquina esta travando, nao so ocupada
+# --------------------------------------------------------------------------
+# O recurso alto sozinho nao e estagnacao — build rodando e build rodando. O
+# que distingue os dois e o atraso que a maquina passa a ter pra si mesma.
+# Cada sinal abaixo e uma daquelas cinco perguntas do spec residente,
+# respondida com numero local. Nenhum deles age: quem decide mexer no
+# sistema e `relief` (fase D2), lendo o que o `stall` mediu.
+
+# Auto-inanicao: o `sleep(interval)` pedido levou este fator vezes o proprio
+# valor para acontecer. Se o daemon nao consegue nem dormir pelo tempo
+# pedido, a maquina parou de escalar quem quer que seja — inclusive ele.
+#
+# Mede-se o `sleep()`, nao o ciclo inteiro: dentro do ciclo moram o scan de
+# processos e a consulta ao Event Log (que lanca `wevtutil`), e nenhum dos
+# dois e fome da maquina — sao trabalho nosso. Confundir os dois faria o
+# indice acusar o Sentinel de travar o Windows a cada 60 segundos.
+STALL_STARVE_FACTOR = 2.0
+
+# Thrash de paginacao. `swap_activity_ps` e o delta por segundo dos
+# contadores cumulativos `sin`+`sout` do psutil, na unidade que o psutil da
+# plataforma devolve — por isso o numero e sobrescrevivel por config, e nao
+# absoluto.
+#
+# No Windows esses dois contadores nao significam nada: o proprio psutil diz
+# que ficam em 0 (medido: sin=0 sout=0). La quem carrega o sinal e o
+# STALL_SWAP_PERCENT abaixo, porque `swap_memory().percent` no Windows e a
+# carga de commit, nao o arquivo de paginacao em si.
+STALL_SWAP_RATE_PS = 256.0
+
+# No Windows o "swap" do psutil e o pagefile, e o percentual dele E a carga
+# de commit (pagefile usado / limite de commit). 90% e o ponto em que o
+# Windows comeca a recusar reserva de memoria — a diferenca entre lento e
+# parado.
+STALL_SWAP_PERCENT = 90.0
+
+# Disco saturado: todo mundo esperando I/O. Sustentado porque um pico isolado
+# de 100% e um fsync, nao uma estagnacao.
+STALL_DISK_BUSY = 95.0
+STALL_DISK_SUSTAINED = 3
+
+# Quantas amostras CONSECUTIVAS um sinal pontual (inanicao, thrash) precisa
+# ver pra valer. Um tick isolado de paginacao pesada e o fsync de um
+# navegador; dois ja sao tendencia. O disco tem teto proprio, mais longo, e o
+# culpado em critico tambem.
+STALL_SIGNAL_SUSTAINED = 2
+
+# Ciclos seguidos com um culpado elegivel em critico sustentado. Condicao
+# necessaria do indice (spec 4): recurso alto sem candidato em critico nao e
+# estagnacao, e carga de trabalho de alguem que pediu por ela.
+STALL_CULPRIT_SUSTAINED = 2
+
+# Amostragem sob estagnacao: o daemon encurta o proprio intervalo pra ver o
+# episodio passar por dentro, e pra saber a hora exata em que acabou.
+SAMPLE_INTERVAL_FAST_S = 0.5
+
 
 # --------------------------------------------------------------------------
 # Falha de aplicativo (Event Log `Application`, lido por wevtutil local)
