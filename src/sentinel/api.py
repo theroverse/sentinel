@@ -77,6 +77,12 @@ def _tail(path: Path, *, max_lines: int = _TAIL_LINES) -> list[str]:
                 need *= 4
     except OSError:
         return []
+    # BOM no comeco do bloco: o daemon escreve sem BOM, mas um `Set-Content
+    # -Encoding UTF8` no log (ou um log criado a mao) poe. Sem tirar daqui, o
+    # `\ufeff` viaja ate o JSON e o `print` morre de UnicodeEncodeError num
+    # console cp1252 — a janela inteira ficava sem resposta por um caractere
+    # que nao existe no conteudo.
+    buf = buf.lstrip(b"\xef\xbb\xbf")
     return buf.decode("utf-8", "replace").splitlines()[-max_lines:]
 
 

@@ -152,6 +152,20 @@ def test_corrupt_line_is_skipped(tmp_path):
     assert events[0]["id"] == event["id"]
 
 
+def test_bom_na_primeira_linha_nao_apaga_a_anomalia_mais_antiga(tmp_path):
+    """O historico e editavel a mao, e o editor/PowerShell pode devolver o
+    arquivo com BOM. Lido como `utf-8` puro, o \\ufeff gruda no primeiro `{` e
+    a linha vira JSON ilegitimo: a anomalia mais antiga sumiria em silencio."""
+    path = tmp_path / "events.jsonl"
+    store = EventStore(path)
+    event = store.record_finding(_finding(), make_sample(ts=_ts()))
+    path.write_text("\ufeff" + path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    events = store.all()
+    assert [e["id"] for e in events] == [event["id"]]
+    assert store.latest_open()["id"] == event["id"]
+
+
 # --------------------------------------------------------------------------
 # schema 2: anomalias de incidente (arvore órfã, queda de app)
 # --------------------------------------------------------------------------

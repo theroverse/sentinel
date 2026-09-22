@@ -74,7 +74,10 @@ class EventStore:
             return []
 
         events: list[dict] = []
-        with self.path.open("r", encoding="utf-8") as fh:
+        # `utf-8-sig`: o historico e editavel a Mao (tirar uma linha, limpar o
+        # arquivo), e Notepad/`Set-Content` poem BOM no comeco. Sem isto a
+        # primeira linha vira JSON ilegitimo e a anomalia mais antiga sumiria.
+        with self.path.open("r", encoding="utf-8-sig") as fh:
             for line in fh:
                 line = line.strip()
                 if not line:

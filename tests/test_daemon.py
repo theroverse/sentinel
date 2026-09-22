@@ -78,6 +78,35 @@ def test_status_reports_not_running_without_pidfile(tmp_path):
     assert st.pid is None
 
 
+def test_read_pid_tolera_bom(tmp_path):
+    """pidfile com BOM daria ValueError no `int()` -> 'daemon parado' para um
+    daemon vivo, e a GUI juraria isso ate o proximo reboot."""
+    paths = settings.paths_for(tmp_path)
+    paths.ensure_output_dir()
+    paths.pid.write_text("\ufeff4242\n", encoding="utf-8")
+    assert daemon._read_pid(paths) == 4242
+
+
+def test_read_heartbeat_tolera_bom(tmp_path):
+    paths = settings.paths_for(tmp_path)
+    paths.ensure_output_dir()
+    # Carimbo sem microssegundos: 25 caracteres, nao os 32 de uma janela fixa.
+    ts = datetime.datetime(2026, 9, 22, 12, 0, tzinfo=datetime.timezone.utc)
+    paths.daemon_log.write_text(f"{ts.isoformat()} tick cpu=1.0\n", encoding="utf-8-sig")
+    assert daemon._read_heartbeat(paths) == ts
+
+
+def test_read_heartbeat_pega_o_batimento_mais_recente(tmp_path):
+    paths = settings.paths_for(tmp_path)
+    paths.ensure_output_dir()
+    t0 = datetime.datetime(2026, 9, 22, 12, 0, tzinfo=datetime.timezone.utc)
+    t1 = t0 + datetime.timedelta(seconds=5)
+    log = "\n".join([f"{t0.isoformat()} tick cpu=1.0", "linha sem carimbo",
+                     f"{t1.isoformat()} tick cpu=2.0"])
+    paths.daemon_log.write_text(log + "\n", encoding="utf-8")
+    assert daemon._read_heartbeat(paths) == t1
+
+
 # --------------------------------------------------------------------------
 # Kill-switch sem GUI: `.sentinel/paused`
 # --------------------------------------------------------------------------

@@ -17,6 +17,7 @@ from conftest import make_sample, proc
 
 from sentinel import api, settings
 from sentinel.detector import SEV_CRITICAL, SEV_WARNING, Finding
+from sentinel.incidents import METRIC_APP_FAILURE, Incident
 from sentinel.events import (
     OUTCOME_FIXED,
     OUTCOME_NOT_FIXED,
@@ -162,6 +163,20 @@ def test_log_lines_limit_nao_corta_a_ponta_mais_recente(paths):
     rows = api.log_lines(paths, limit=5)
     assert len(rows) == 5
     assert "cpu=19.0" in rows[0]["text"]
+
+
+def test_log_lines_descarta_bom_da_primeira_linha(paths):
+    """Um `daemon.log` escrito por PowerShell (`Set-Content -Encoding UTF8`) vem
+    com BOM. Sem removelo o \\ufeff viaja dentro do JSON e faz o `print` da
+    resposta morrer num console cp1252 — a janela fica muda."""
+    t0 = datetime.datetime(2026, 9, 22, 12, 0, tzinfo=datetime.timezone.utc)
+    paths.daemon_log.write_text(
+        "\ufeff" + tick(t0, cpu=3.0) + "\n", encoding="utf-8"
+    )
+    rows = api.log_lines(paths)
+    assert len(rows) == 1
+    assert rows[0]["text"].startswith("tick cpu=3.0")
+    assert "\ufeff" not in api.dump({"log": rows})
 
 
 # ------------------------------------------------------- thresholds() ------
@@ -359,6 +374,27 @@ def test_plan_da_base_local_responde_antes_do_catalogo(paths):
 
     depois = api.plan(paths, event)
     assert depois["options"][0]["key"] == outras[-1]
+
+
+def test_label_acentuada_de_incidente_sobe_no_dump_sem_quebrar(paths):
+    """O texto de um incidente vem do Event Log, com acento ('parou de
+    funcionar'). Se ele nao sobreviver ao dump + print, a ponte devolve JSON
+    truncado e a GUI mostra 'o motor nao respondeu nada'."""
+    inc = Incident(
+        metric=METRIC_APP_FAILURE,
+        severity=SEV_WARNING,
+        detail={"kind": "crash", "app": "Genesis.exe", "exception_code": "0xc0000005"},
+        fingerprint="app_failure:warning:genesis.exe",
+        label="Genesis.exe parou de funcionar (exceção 0xc0000005)",
+    )
+    EventStore(paths.events).record_incident(
+        inc, now=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    payload = api.dump({"events": api.event_rows(paths)})
+    assert "funcionar" in payload
+    assert "\ufeff" not in payload
+    assert json.loads(payload)["events"][0]["label"] == inc.label
 
 
 # -------------------------------------------------------------- resolve() --

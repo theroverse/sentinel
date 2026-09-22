@@ -33,7 +33,9 @@ class DaemonStatus:
 
 def _read_pid(paths: settings.Paths) -> int | None:
     try:
-        text = paths.pid.read_text(encoding="utf-8").strip()
+        # `utf-8-sig` tambem aqui: um pidfile com BOM daria `int()` -> ValueError
+        # -> "daemon parado" para um daemon vivo, o pior tipo de mentira.
+        text = paths.pid.read_text(encoding="utf-8-sig").strip()
     except OSError:
         return None
     try:
@@ -98,13 +100,16 @@ def status(paths: settings.Paths) -> DaemonStatus:
 
 def _read_heartbeat(paths: settings.Paths) -> datetime.datetime | None:
     try:
-        text = paths.daemon_log.read_text(encoding="utf-8")
+        text = paths.daemon_log.read_text(encoding="utf-8-sig")
     except OSError:
         return None
     # Última linha com um ISO parseável é o batimento mais recente.
     last = None
     for line in text.splitlines():
-        stamp = line[:32].strip()
+        # `partition`, não fatia: um carimbo sem microssegundos tem 25
+        # caracteres e uma janela fixa de 32 engoliria o " tick" junto,
+        # transformando "daemon vivo, sem batimento" em mentira.
+        stamp, _, _rest = line.partition(" ")
         try:
             last = datetime.datetime.fromisoformat(stamp)
         except ValueError:
