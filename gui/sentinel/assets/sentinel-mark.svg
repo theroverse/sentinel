@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Sentinel: olho de radar varrendo. Vermelho vigia #B3121B, brasa
+       #E11D29, sombra #7E0C12, campo grafite #0B0C0E. -->
+  <circle cx="32" cy="32" r="25" fill="#B3121B" fill-opacity="0.10"
+          stroke="#B3121B" stroke-width="3"/>
+  <path d="M32 32 L50 17" stroke="#E11D29" stroke-width="2.5"
+        stroke-linecap="round" stroke-opacity="0.85"/>
+  <circle cx="32" cy="32" r="14" fill="none" stroke="#7E0C12"
+          stroke-width="2.5" stroke-dasharray="4.5 5.5"/>
+  <path d="M17 32 Q32 21 47 32 Q32 43 17 32 Z" fill="none" stroke="#E11D29"
+        stroke-width="2.5" stroke-linejoin="round"/>
+  <circle cx="32" cy="32" r="5.5" fill="#B3121B"/>
+  <circle cx="34.2" cy="30" r="1.6" fill="#F4F5F7" fill-opacity="0.85"/>
+  <path d="M32 3 V9 M32 55 V61 M3 32 H9 M55 32 H61" stroke="#B3121B"
+        stroke-width="2.5" stroke-linecap="round"/>
+</svg>

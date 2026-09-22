@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sentinel — console de vigilância</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="titlebar" id="titlebar">
+      <div class="titlebar-brand">
+        <span class="titlebar-mark" id="titlebar-mark" aria-hidden="true">
+          <img src="assets/sentinel-mark.svg" alt="" width="15" height="15" />
+        </span>
+        <span class="titlebar-text">SENTINEL<span class="titlebar-text-dim">.EXE</span></span>
+        <span class="state-pill" id="daemon-pill" role="status"></span>
+        <span class="titlebar-phase" id="titlebar-phase">dados de exemplo</span>
+      </div>
+      <div class="titlebar-actions">
+        <button class="win-btn" id="btn-min" title="Minimizar">&#8211;</button>
+        <button class="win-btn win-btn-close" id="btn-close" title="Fechar">&#10005;</button>
+      </div>
+    </header>
+
+    <div class="shell">
+      <nav class="sidebar" id="sidebar" aria-label="Seções"></nav>
+      <main class="content" id="content" tabindex="-1"></main>
+    </div>
+
+    <footer class="statusbar">
+      <div class="statusbar-left" id="statusbar-left"></div>
+      <div class="statusbar-right" id="statusbar-right"></div>
+    </footer>
+  </div>
+
+  <div id="modal-root"></div>
+
+  <script src="mock.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

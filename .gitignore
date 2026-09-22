@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Dependencia de runtime (psutil) nao e versionada aqui; ver README.
+
+# Testes / cobertura
+.coverage
+.pytest_cache/
+htmlcov/
+
+# Saida do proprio Sentinel quando rodado dentro deste repo em testes
+.sentinel/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Payload gerado (scripts/build-payload.ps1) e artefatos do exe
+.build/
+*.exe
