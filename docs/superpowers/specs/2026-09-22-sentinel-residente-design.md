@@ -288,19 +288,42 @@ preenche na leitura com o número daquele evento (seção 8). Uma opção do
 catálogo que não tem como preencher o seu token é um buraco visível — e há
 teste pra isso, não revisão de volante.
 
-## 10. Motor local, compartilhado com a Athena
+## 10. Motor local (estado atual: implementado; provisionamento fora de escopo)
 
-Não é um segundo Ollama. É **um servidor para os dois** — a Athena já tem o
-único cliente Ollama do monorepo (`athena/src/athena/summarizer/ollama_client.py`:
-`/api/generate`, `/api/chat`, `/api/embeddings`, sonda `GET /api/tags`,
-stdlib `urllib`) e o modelo padrão dela é `llama3.2`. O Sentinel usa o mesmo
-servidor, a mesma porta e **o mesmo modelo**: puxar um modelo diferente pra
-economizar um prompt seria gastar 2 GB de disco alheio à toa.
+> Reescrito em 2026-09-22 depois da entrega. Esta seção descrevia um motor
+> compartilhado com a Athena e um `sentinel model setup` que instala e puxa
+> modelo. O reescopo da seção 13.1 tirou o provisionamento do Sentinel — "o
+> runtime eu cuido, você só precisa se comunicar com ele quando necessário"
+> — e trocou o modelo. O que está aqui embaixo é o código que existe.
 
-Forma do código: cópia própria (~120 linhas), não import da Athena. O
-monorepo já é assim por decisão (`system/process.py` existe quatro vezes);
-importar `athena.settings` criaria acoplamento entre satélites que não se
-conhecem. A cópia traz três diferenças deliberadas:
+Não é um segundo Ollama nem um segundo nada: é **um cliente**. A Athena tem
+o seu (`athena/src/athena/summarizer/ollama_client.py`), e os dois continuam
+sendo cópias próprias por decisão do monorepo (`system/process.py` existia
+quatro vezes) — importar o `settings` de um satélite no outro criaria
+acoplamento entre ferramentas que não se conhecem.
+
+Forma do que foi escrito (`src/sentinel/local_model.py`):
+
+- Transporte: Ollama `POST http://127.0.0.1:11434/api/generate`
+  (`stream: false`) e, se aquele servidor não tem a rota (404/405), um
+  endpoint OpenAI-compatível (`/v1/chat/completions`) — LM Studio e
+  llama.cpp server na mesma porta de loopback.
+- **Invariante de privacidade reforçada**: host fora de `127.0.0.1`/`::1`/
+  `localhost` é recusado **no código**, não na config — vale para a env var e
+  para o `config.json`. Timeout curto na sonda, um timeout só na geração.
+- Recusa de conexão **não** dobra a espera: se o host está morto, o segundo
+  dialeto está no mesmo host morto, e tentar os dois é só fazer o usuário
+  esperar duas vezes.
+- Duas funções públicas: `complete(prompt)` → texto ou `None`, e
+  `probe()` → diagnóstico. As costuras `post`/`get` são injetáveis, então a
+  suíte inteira roda sem abrir socket.
+- Ausência do motor é estado normal: o `fix` roda a camada 3 (base curada) e
+  diz `source=kb:metrica`. `sentinel model status [--json]` é a única
+  superfície disso na CLI — sonda, não instala, não baixa, não escreve.
+- Modelo padrão: **`qwen3-coder-next`** (`SENTINEL_OLLAMA_MODEL` para trocar;
+  ver seção 13.1). A quantização `Q2_K` é propriedade do arquivo GGUF que o
+  usuário carregou, não uma escolha deste cliente, por isso não aparece no
+  nome.
 
 | | Athena hoje | Sentinel |
 |---|---|---|
@@ -308,73 +331,47 @@ conhecem. A cópia traz três diferenças deliberadas:
 | host remoto | aceita o que a env mandar | **recusa fora de loopback, no código** |
 | Ollama ausente | cai em `claude -p` no modo `auto` | **não cai**: a base curada responde e diz de onde veio |
 
-`local_model.py` substitui `claude_client.py` no caminho crítico:
+`claude_client.py` foi apagado com a mudança. Se `claude -p` ficar em algum
+lugar do Theroverse, é fora do Sentinel: aqui a política local não tem mais
+exceção nenhuma.
 
-- Transporte: Ollama `POST http://127.0.0.1:11434/api/generate`
-  (`stream: false`), e um transporte OpenAI-compatível
-  (`/v1/chat/completions`) para LM Studio/llama.cpp server.
-- **Invariante de privacidade reforçada**: host fora de `127.0.0.1`/`::1`/
-  `localhost` é recusado no código, não na config. Timeout curto. Sem
-  telemetria, sem chamada de descoberta.
-- Ausência do motor é estado normal: o `fix` roda na base curada e diz de
-  onde veio. Nada na interface finge que há IA.
-- `claude -p` sai do caminho do Sentinel. Se ficar, é opt-in explícito e
-  rotulado como saída de rede — o que hoje é a única exceção à política
-  local e deixa de ser.
-- Modelo padrão: **`llama3.2`** (o da Athena). O trabalho é formatar até 3
-  opções com `why`, não raciocinar sobre o disco.
+### Provisionamento: tirado do escopo, registrado pra quem o fizer
 
-### Provisionamento: instalar e puxar só o que falta
+Medição desta máquina (2026-09-22): `where ollama` vazio e
+`127.0.0.1:11434` recusando conexão — **não há motor instalado**. Ainda assim
+o Sentinel não instala nada: a decisão da seção 13.1 é que o runtime é de
+quem o usa, e o `fix` sem motor responde da base curada. O que sobrou aqui é
+o caminho que **outro** projeto (o Genesis, preparador de máquina) pode
+percorrer, com as evidências já medidas:
 
-Medição desta máquina (2026-09-22): `where ollama` vazio e `127.0.0.1:11434`
-recusando conexão — **o Ollama não está instalado**, então hoje o
-`--backend auto` da Athena cai em `claude -p`. E ninguém instala hoje: o
-Genesis, que é o preparador de máquina, não tem uma linha sobre Ollama.
-
-`sentinel model setup` faz o ciclo, idempotente, na ordem:
-
-1. **Sonda** `GET /api/version` no loopback → se responde, nada a instalar.
-2. **Instala se faltar**: `winget install -e --id Ollama.Ollama --silent
+1. Sondar `GET /api/version` no loopback → se responde, nada a instalar.
+2. Instalar se faltar: `winget install -e --id Ollama.Ollama --silent
    --accept-package-agreements --accept-source-agreements`. Verificado no
    manifest: v0.34.2, instaladora **Inno** (`OllamaSetup.exe`) em escopo de
    usuário (`%LOCALAPPDATA%\Programs\Ollama`) — **sem UAC**, o que mantém de
    pé a decisão "sem elevação" da seção 5.
-3. **Garante o servidor**: se instalado mas mudo, `ollama serve` em segundo
-   plano; o Sentinel não compete pelo controle do serviço com a GUI do
-   Ollama, só espera a porta responder.
-4. **Puxa o modelo só se não existir**: `ollama list` → se `llama3.2` não
-   estiver lá, `ollama pull llama3.2`. É download grande (~2 GB): pede
-   confirmação explícita, mostra o tamanho e fala a origem
-   (`ollama.com`/GitHub), porque é o único instante em que o Sentinel toca a
-   rede por um motivo que não é o usuário mandando.
-5. **Relata** o que encontrou pronto e o que fez — `already installed,
-   model present` é uma resposta tão boa quanto `installed`.
+3. Garantir o servidor, sem competir com a GUI do Ollama: só esperar a porta
+   responder.
+4. Puxar o peso só se não existir — e um `pull` é download grande, pede
+   confirmação explícita e diz a origem. O primeiro uso do Ollama 0.34
+   pergunta *"sign in or continue locally"*: o fluxo não-interativo tem que
+   cair em **local**.
+5. Relatar o que achou pronto: `already installed, model present` é uma
+   resposta tão boa quanto `installed`.
 
-Guardas, e elas importam mais que o conforto:
-
-- **Nada disso roda no daemon.** O provisionamento é comando de terminal,
-  disparado por você (ou pela bandeja, que só reexecuta o `sentinel model
-  setup` já escrito). Um processo residente que baixa 2 GB sozinho é
-  exatamente a traição de confiança que este projeto evita.
-- A nota de versão do Ollama 0.34 avisa de um primeiro uso com escolha
-  *"sign in or continue locally"*: o fluxo sem interação tem que cair em
-  **local**, e o Sentinel não abre a GUI de conta em nome de ninguém.
-- Instalação não é pré-requisito de vigilância: sem Ollama, o Sentinel segue
-  100% funcional na base curada (`kb`), e o `fix --explain-source` mostra
-  que veio de lá.
-
-Segundo passo, fora do escopo do Sentinel mas registrado aqui: o Genesis
-deveria ganhar `Install-Ollama.ps1` com o mesmo padrão idempotente que ele
-já usa para o Claude Code (`Test-CommandExists` → instala). Se só o Sentinel
-souber provisionar, uma máquina nova precisa abrir o Sentinel para entregar
-o backend que a Athena usa.
+O que o Sentinel entrega no lugar é o diagnóstico, não a instalação:
+`sentinel model status [--json]` — dialeto, versão e se o modelo pedido está
+anunciado. Um vigilante que baixa gigabytes sozinho é exatamente a traição de
+confiança que este projeto evita; e instalação nunca foi pré-requisito de
+vigilância.
 
 ## 11. Impacto no que já existe
 
-- **CLI**: `sentinel tray`, `sentinel orders list|grant|revoke|shadow`,
-  `sentinel pause|resume`, `sentinel kb stats`, `sentinel model status|setup`
-  (sonda, instalação, `pull` — seção 10), flags `--json` da fase 0 da spec da
-  GUI, `sentinel relief <pid> [--restore]`.
+- **CLI**: entregue — `pause` / `resume`, `kb [--json]`, `model status
+  [--json]`, `fix --explain-source`. Pendente — `orders list|grant|revoke|shadow`
+  e `relief <pid> [--restore]` (fases D/E), e os `--json` da fase 0 da spec da
+  GUI. Fora de escopo — `sentinel tray` (a bandeja saiu, seção 13.1) e
+  `sentinel model setup` (o provisionamento saiu, seção 10).
 - **daemon**: árvore por ciclo, índice de stall, executor de degraus,
   leitura do `paused`, prioridade própria alta. Roda como usuário comum.
 - **`SentinelHost.ps1`**: o prompt `YesNo` de reabrir como administrador
@@ -402,12 +399,12 @@ o backend que a Athena usa.
 
 | fase | entrega | risco |
 |---|---|---|
-| A | falha de app + órfão + schema 2 + testes | nenhum (só lê) |
-| B | `kb.db`, formato assertivo, reescrita do conteúdo, ranking | nenhum |
-| C | bandeja + toast + pause/resume | baixo |
+| A | ✔ falha de app + órfão + schema 2 + testes | nenhum (só lê) |
+| B | ✔ `kb.db`, formato assertivo, reescrita do conteúdo, ranking | nenhum |
+| C | ✔ pause/resume em arquivo (a bandeja e o toast saíram — 13.1) | baixo |
 | D | stall index + degrau 1 **já ligado** + guardas (rate limit, cooldown, `paused`) + chave de modo sombra | médio |
 | E | degraus 2 e 3, ordens permanentes por crachá, teto por job | **alto — precisa da sua revisão das guardas** |
-| F | `local_model.py` + `sentinel model setup` (sonda/instala/puxa) + vistas novas da GUI | médio (rede + instalação de terceiro, ambas sob confirmação) |
+| F | ✔ `local_model.py` (sonda + dois dialetos, veto de loopback) e `model status`; o `setup` saiu (13.1). Restam as vistas novas da GUI | baixo (nenhuma instalação, nenhuma inferência no daemon) |
 
 Cada fase fecha com pytest verde e o detector do impeccable na GUI.
 
@@ -415,7 +412,9 @@ Cada fase fecha com pytest verde e o detector do impeccable na GUI.
 
 Registradas aqui porque são o que a implementação não pode reabrir sozinha.
 
-1. **Motor local: Ollama, e o Sentinel provisiona.** Não é um Ollama do
+1. **Motor local: Ollama, e o Sentinel provisiona.** *Superscrito pela
+   seção 13.1: o provisionamento saiu do Sentinel e o modelo mudou.*
+   Não é um Ollama do
    Sentinel — é o Ollama da máquina, o mesmo que a Athena usa, com o mesmo
    modelo (`llama3.2`). `sentinel model setup` instala se faltar e puxa o
    modelo se ele não estiver lá; nunca roda sozinho, nunca no daemon
@@ -423,7 +422,8 @@ Registradas aqui porque são o que a implementação não pode reabrir sozinha.
    Medições de 2026-09-22 que sustentam isso: Ollama **ausente** desta máquina
    (`where ollama` vazio, `11434` recusando), **nenhum** código no monorepo o
    instala hoje, e o instalador é Inno em escopo de usuário — cabe na regra
-   "sem elevação".
+   "sem elevação". O que sobreviveu à mudança: nenhum modelo pago, nenhuma
+   inferência externa, nada no daemon, e o veto de loopback no código.
 2. **Degrau 1 ligado desde o início, sem crachá.** Rebaixar prioridade sob
    stall é a resposta ao "aviso atrasado": funciona onde o travamento
    acontece e se desfaz sozinho. Os degraus 2 e 3 exigem crachá por app, e
@@ -467,9 +467,14 @@ implementação; é o escopo sendo corrigido por quem manda na máquina.
    `SENTINEL_OLLAMA_MODEL` / `SENTINEL_OLLAMA_HOST`, com o invariante de
    privacidade intacto: host fora de loopback é recusado no código.
 4. **Consequência boa e deliberada:** sem o `claude -p` no caminho, a política
-   "só local" deixa de ter a única exceção que ela tinha. O Sentinel passa a
-   não ter nenhuma saída de rede em nenhum modo — inclusive no `fix`.
+   "só local" deixa de ter a única exceção que ela tinha. Nenhuma linha do
+   Sentinel atravessa a placa de rede: o único socket que ele abre é com a
+   própria máquina (loopback), e mesmo esse só a pedido, num `sentinel fix`.
 5. **Motor ausente continua estado normal**, como já dizia a seção 10: a base
    curada responde e o `fix --explain-source` diz de onde veio. A diferença é
-   que agora "ausente" é a situação desta máquina até o usuário ligar o dele.
+   que agora não há mais um `setup` prometido atrás do vazio — a ausência é o
+   fim da linha, e o `model status` é quem a declara.
+
+Itens 2, 3 e 4 foram entregues junto com `local_model.py` (fase F da tabela
+acima); o item 1 permanece entregue só na parte do kill-switch.
 

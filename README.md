@@ -40,9 +40,11 @@ resto do ecossistema orbitando o
   a mesma causa, por último o catálogo da métrica. Cada "funcionou / não
   funcionou" seu reordena a resposta da próxima vez.
 - **Privacidade estrita, 100% local.** Nada de telemetria. A única saída
-  de rede é a ponte com o modelo, disparada **só quando você roda** `sentinel
-  fix` **e** a base já esgotou o que tinha a dizer sobre aquela anomalia. Sem
-  ponte, ele responde da base curada. O daemon nunca chama IA.
+  de rede é a pergunta a um **modelo nesta mesma máquina** (loopback),
+  disparada **só quando você roda** `sentinel fix` **e** a base já esgotou o
+  que tinha a dizer sobre aquela anomalia. Um endereço que não seja a sua
+  própria máquina é **recusado no código**, não na config — sem exceção para
+  IA paga. Sem motor, ele responde da base curada. O daemon nunca chama IA.
 - **Seguro por construção.** `sentinel kill` nunca encerra processo do
   sistema (lista protegida), recusa matar a si mesmo, mostra a árvore de
   processos e pede confirmação explícita — e só funciona numa sessão
@@ -53,11 +55,19 @@ resto do ecossistema orbitando o
 - Python 3.10+
 - **psutil** (`pip install psutil`) — única dependência de runtime, usada
   pra ler as métricas localmente
-- Um modelo pra fechar a escada (hoje: Claude Code via `claude -p`) —
-  **opcional, e raro**: só é consultado quando a base local já esgotou o que
-  tinha a dizer sobre aquela anomalia. Sem ele, o Sentinel responde da base
-  curada e continua aprendendo com seus desfechos. (O motor local da fase
-  seguinte é o Ollama compartilhado com a Athena — ver `docs/superpowers/`.)
+- Um **modelo local** pra fechar a escada — **opcional, e raro**: só é
+  consultado quando a base local já esgotou o que tinha a dizer sobre aquela
+  anomalia. Qualquer servidor na sua máquina serve: Ollama
+  (`http://127.0.0.1:11434`) ou um endpoint OpenAI-compatível (LM Studio,
+  llama.cpp server). O Sentinel **não instala nem baixa nada** — quem provê
+  o motor é você; `sentinel model status` diz o que ele encontrou. Sem motor,
+  o `fix` responde da base curada e continua aprendendo com seus desfechos.
+
+O endereço e o nome do modelo se escolhem por variável de ambiente
+(`SENTINEL_OLLAMA_HOST`, `SENTINEL_OLLAMA_MODEL`) ou por
+`.sentinel/config.json` (`"ollama_host"`, `"ollama_model"`); o padrão é
+`http://127.0.0.1:11434` com `qwen3-coder-next`. Host fora de loopback é
+recusado, venha ele da env ou do config.
 
 ## Instalação
 
@@ -77,6 +87,7 @@ python sentinel.py events --open-only # anomalias registradas
 python sentinel.py fix                # tutorial guiado da mais recente
                                       # (pergunta à base local antes de qualquer modelo)
 python sentinel.py kb                 # o que a base já aprendeu
+python sentinel.py model status       # o motor local está vivo? anuncia o modelo?
 python sentinel.py kill <PID>         # encerra um processo-problema (seguro)
 python sentinel.py pause              # para de registrar (kill-switch)
 python sentinel.py resume             # retoma
@@ -127,7 +138,7 @@ flowchart TD
     C --> D["sentinel fix"]
     D --> K[".sentinel/kb.db<br/><i>camada 1: fingerprint · 2: métrica+causa · 3: métrica</i>"]
     K -- "responde" --> H
-    K -- "esgotada" --> E{modelo disponível?}
+    K -- "esgotada" --> E{motor local disponível?}
     E -- sim --> F["≤3 opções → a base aprende (camadas 1+2)"]
     E -- não --> G["catálogo curado da métrica"]
     F --> H["ciclo: aplica → você valida → próxima se não"]
@@ -174,7 +185,7 @@ A consulta sobe uma escada de especificidade e para na primeira que responde:
 | 1 | `fp:<fingerprint>` | esta anomalia exata, com este processo, já vista |
 | 2 | `causa:<métrica>+<causa>` | mesma métrica, mesma causa raiz |
 | 3 | `metrica:<métrica>` | catálogo curado da métrica |
-| 4 | — | um modelo, quando a base não tem o que dizer |
+| 4 | — | um **modelo local** (loopback), quando a base não tem o que dizer |
 
 A **causa** é uma assinatura, não um sintoma: num crash é o módulo que
 falhou (a mesma DLL derruba apps diferentes), num episódio de órfãos é o pai
@@ -218,6 +229,25 @@ python sentinel.py kb --json              # os mesmos números para script
 Se `kb` mostrar `aprendidas: 0` depois de semanas de uso, "a base aprende" é
 uma frase de marketing — e é por isso que o comando existe.
 
+### O motor local, e a ausência dele
+
+`sentinel model status` responde três perguntas e nenhuma a mais: tem
+qualquer coisa no endereço? que dialeto ele fala (Ollama ou OpenAI)? ele
+anuncia o modelo pedido? É só leitura — o comando não instala runtime, não
+baixa peso, não toca em arquivo nenhum. Provisionar é seu, e é uma decisão,
+não um esquecimento: um processo residente que baixa gigabytes sozinho é o
+tipo de coisa que faz um vigilante merecer desconfiança.
+
+```
+python sentinel.py model status           # vivo / dialeto / versão / modelo
+python sentinel.py model status --json    # os mesmos campos para a GUI
+```
+
+A ausência não é um erro nem um degrau abaixo: o `fix` roda a camada 3 — o
+catálogo curado — e diz `source=kb:metrica`. O que ele *não* faz é fingir que
+há IA respondendo. E o veto é de código: um `SENTINEL_OLLAMA_HOST` apontando
+para outra máquina faz o Sentinel recusar a pergunta, não obedecer.
+
 ## Comandos
 
 | Comando | O que faz |
@@ -229,6 +259,7 @@ uma frase de marketing — e é por isso que o comando existe.
 | `events [--open-only] [--limit N] [--json]` | Lista anomalias. |
 | `fix [ID]` | Ciclo de tutoria sobre uma anomalia (padrão: a mais recente aberta). `--explain-source` diz qual camada respondeu e o que pesou no ranking. |
 | `kb [--json]` | Inventário da base local: tipos, opções (curadas × aprendidas) e desfechos por anomalia. |
+| `model status [--json]` | Sonda o motor local: vivo? que dialeto? anuncia o modelo pedido? Só leitura — não instala nem baixa nada. |
 | `kill <PID> [--tree]` | Encerra um processo com lista protegida + confirmação; `--tree` inclui descendentes. |
 | `prune --older-than DIAS` | Apaga eventos antigos. |
 | `config [--show-source]` | Mostra limiares ativos e caminhos. |
@@ -315,9 +346,8 @@ sentinel/
 │   ├── tutor.py            # máquina de estados do ciclo de feedback
 │   ├── processctl.py       # árvore de processos + kill seguro
 │   ├── prompts.py          # prompt do tutorial (≤3 opções, PT-BR)
-│   ├── claude_client.py    # ponte `claude -p` + parse tolerante (camada 4)
+│   ├── local_model.py      # motor local em loopback + parse tolerante (camada 4)
 │   └── system/
-│       ├── process.py      # execução de comandos (Windows/POSIX)
 │       └── prompt.py       # confirmação y/n (tty-aware)
 ├── tests/                  # pytest, com psutil falso + wevtutil falso (nada real)
 ├── requirements-dev.txt    # pytest, pytest-cov (psutil é runtime, não dev)
@@ -338,8 +368,9 @@ sobre um arquivo temporário — `sqlite3` é stdlib, não há o que simular, e 
 fake de banco testaria o fake. Um teste varre o catálogo curado procurando
 hedging proibido ("geralmente", "pode ser que", "recomendamos", "tente") e
 token que não fecha; ou seja: conselho vago ou texto com `{rss}` solto
-quebra a suíte. O teste marcado `live` (se adicionado) é o único que tocaria
-uma ponte real e não roda no CI.
+quebra a suíte. `local_model` é testado com o HTTP injetado (`post`/`get`
+fakes): nem a suíte nem o `fix` de teste abrem socket. O teste marcado `live`
+(se adicionado) é o único que tocaria um motor real e não roda no CI.
 
 ## Limitações conhecidas
 
@@ -347,8 +378,10 @@ uma ponte real e não roda no CI.
 - `io_busy` no Windows é uma aproximação (tempo de IO agregado /
   wall-clock), não o contador nativo de % disk time.
 - Rede é correlação informativa — nunca dispara tutorial sozinha.
-- A camada 4 ainda é a ponte `claude -p`; o motor local (Ollama + um modelo
-  só, compartilhado com a Athena) é a próxima fase do spec residente.
+- A camada 4 depende de um motor que **você** provê: sem servidor local no
+  endereço, o `fix` responde da base curada (e o `model status` diz disso).
+  O Sentinel não instala runtime nem baixa modelo — decisão registrada no
+  spec residente.
 - A base não generaliza sozinha: uma vitória contada contra o `chrome` não
   vale pro `chromium`. fingerprints diferentes, históricos diferentes — é
   conservador de propósito, pra um processo não herdar a reputação do vizinho.

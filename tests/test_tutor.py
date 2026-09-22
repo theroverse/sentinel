@@ -73,7 +73,7 @@ def test_cycle_advances_on_no_then_fixes(tmp_path):
         store,
         interactive=True,
         options=OPTS,
-        source="claude",
+        source="modelo",
         validate=lambda: next(responses),
         echo=lambda *a: None,
     )
@@ -158,7 +158,7 @@ def test_kill_action_offers_execute(tmp_path):
             interactive=True,
             ctl=FakeCtl(),
             options=[kill_opt],
-            source="claude",
+            source="modelo",
             validate=lambda: tutor.RESPONSE_FIXED,
             echo=lambda *a: None,
         )
@@ -201,7 +201,7 @@ def test_kill_skips_protected_and_picks_real_target(tmp_path):
             interactive=True,
             ctl=FakeCtl(),
             options=[kill_opt],
-            source="claude",
+            source="modelo",
             validate=lambda: tutor.RESPONSE_FIXED,
             echo=lambda *a: None,
         )
@@ -234,7 +234,7 @@ def test_kill_no_target_when_all_protected(tmp_path):
         interactive=True,
         ctl=BoomCtl(),
         options=[kill_opt],
-        source="claude",
+        source="modelo",
         validate=lambda: tutor.RESPONSE_FIXED,
         echo=lambda *a: None,
     )
@@ -317,7 +317,7 @@ def test_finding_prompt_is_untouched_by_the_incident_block(tmp_path):
 
 
 def test_propose_uses_kb_templates_for_incident_metrics():
-    with patch("sentinel.tutor.call_claude", return_value=None):
+    with patch("sentinel.local_model.complete", return_value=None):
         options, source, layer = tutor.propose(_incident_event())
     assert source == kbstore.LAYER_NAME[kbstore.LAYER_METRIC]
     assert layer == kbstore.LAYER_METRIC
@@ -365,7 +365,7 @@ def _finding_event(
 def test_propose_asks_the_local_base_before_the_model(tmp_path):
     event = _finding_event()
     with kbstore.open_store(tmp_path / "kb.db") as db:
-        with patch("sentinel.tutor.call_claude") as model:
+        with patch("sentinel.local_model.complete") as model:
             options, source, layer = tutor.propose(event, db=db)
     assert model.call_count == 0, (
         "a camada 3 da base ja respondia; nao havia porque chamar um modelo"
@@ -390,7 +390,7 @@ def test_propose_learns_from_the_model_once_the_base_ran_out(tmp_path):
         for option in curated:
             db.record(event, option, outcome=OUTCOME_NOT_FIXED, source="kb:metrica")
         before = db.count_options()
-        with patch("sentinel.tutor.call_claude", return_value=resposta) as model:
+        with patch("sentinel.local_model.complete", return_value=resposta) as model:
             options, source, layer = tutor.propose(event, db=db)
         assert model.call_count == 1
         assert source == "modelo" and layer == kbstore.LAYER_MODEL

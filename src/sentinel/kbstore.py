@@ -41,8 +41,8 @@ LAYER_METRIC = 3
 LAYER_MODEL = 4
 
 # Nome da camada em texto, pra `--explain-source` e pro campo `source` da
-# resolucao. A camada 4 e o motor (hoje `claude`, depois Ollama); as tres
-# primeiras sao a base local.
+# resolucao. A camada 4 e o motor local (`local_model`: Ollama / endpoint
+# OpenAI-compativel em loopback); as tres primeiras sao a base local.
 LAYER_NAME = {
     LAYER_FINGERPRINT: "kb:fingerprint",
     LAYER_CAUSE: "kb:causa",

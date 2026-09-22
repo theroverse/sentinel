@@ -588,7 +588,7 @@ function renderTutor(host) {
       '<span class="inline-code">not_fixed</span> e fecha o evento como ' +
       '<span class="inline-code">dismissed</span> — a anomalia continua no histórico pelo ' +
       '<span class="inline-code">fingerprint</span>, e na próxima vez o ' +
-      '<span class="inline-code">claude -p</span> pode acrescentar opções novas.</div></div>' +
+      '<span class="inline-code">motor local</span> pode acrescentar opções novas.</div></div>' +
       '<div class="btn-row" style="margin-top:16px"><button class="btn btn-ghost" data-retry="1">Repetir do início</button>' +
       '<button class="btn btn-ghost" data-goto="anomalias">Voltar às anomalias</button></div>';
   } else {
@@ -761,7 +761,7 @@ function viewAjustes(host) {
   ];
   const rules = [
     ICON.shield + "<div>Roda 100% local: sem servidor, sem telemetria, sem asset hospedado, sem fonte web. Nada sai da máquina porque você pediu.</div>",
-    ICON.terminal + '<div>A única saída de rede é o <span class="inline-code">claude -p</span> que gera opções novas — disparado por você numa correção, nunca pelo daemon.</div>',
+    ICON.terminal + '<div>A única saída de rede é a pergunta a um <span class="inline-code">motor local</span> (loopback) que gera opções novas — disparado por você numa correção, nunca pelo daemon.</div>',
     ICON.lock + "<div>Processo protegido do Windows e o próprio Sentinel nunca são encerrados: o Python recusa antes de a GUI perguntar.</div>",
     ICON.info + '<div>Anomalia de rede é contexto, não defeito: entra como <span class="inline-code">info</span> e não oferece ação automática.</div>',
     ICON.warn + "<div>Severidade nunca é só cor: cada estado tem glifo e palavra em português, porque vermelho é o único matiz semântico desta casa.</div>",

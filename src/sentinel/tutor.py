@@ -2,8 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from sentinel import kb, kbstore, prompts, settings
-from sentinel.claude_client import call_claude, parse_options
+from sentinel import kb, kbstore, local_model, prompts, settings
 from sentinel.events import (
     OUTCOME_DISMISSED,
     OUTCOME_FIXED,
@@ -154,9 +153,9 @@ def propose(
         if options:
             return options, kbstore.LAYER_NAME[layer], layer
 
-    raw = call_claude(build_prompt(event))
+    raw = local_model.complete(build_prompt(event), overrides=overrides)
     if raw:
-        options = parse_options(raw, max_options=settings.MAX_FIX_OPTIONS)
+        options = local_model.parse_options(raw, max_options=settings.MAX_FIX_OPTIONS)
         if options:
             if db is not None:
                 db.learn(event, options, source=kbstore.LAYER_MODEL)
@@ -306,7 +305,7 @@ def run_cycle(
     DISMISSED.
 
     Todo ponto de decisao e injetavel (options/source/validate/ctl/echo) pra
-    o teste rodar o ciclo inteiro sem claude, sem tty e sem matar processo
+    o teste rodar o ciclo inteiro sem motor local, sem tty e sem matar processo
     real. Em sessao nao-interativa so APRESENTA as opcoes e sai (nunca
     bloqueia esperando tecla).
 

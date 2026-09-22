@@ -62,7 +62,7 @@ fiação qualquer, o CLI ganha modo máquina, com testes:
 | `sentinel metrics --json` | última amostra: cpu/ram/disk/io/net + top_cpu/top_mem + status do daemon |
 | `sentinel events --json` (já existe) | eventos + resoluções |
 | `sentinel status --json` | running/pid/last_heartbeat |
-| `sentinel fix <id> --plan --json` | opções (claude ou kb) sem perguntar nada |
+| `sentinel fix <id> --plan --json` | opções (base local ou motor) sem perguntar nada |
 | `sentinel fix <id> --resolve --option N --outcome fixed\|not_fixed --json` | grava resolution sem tty |
 | `sentinel fix <id> --dismiss --json` | grava `outcome=dismissed` sem tty (o desfecho já existe em `tutor.RESPONSE_DISMISS`; falta a porta não-interativa) |
 | `sentinel kill <pid> --yes --json` | `{killed, failed, refused_reason}` |
@@ -83,7 +83,8 @@ OnDocumentCreated`/callback de resposta. Substituir `mock.js` pelo adapter,
 sem rede desenhar.
 
 O adapter tem que fornecer o que o mock hoje fixa, ou a interface mente:
-`source` de cada rodada de tutoria (`claude` | `kb` — a badge "base local"
+`source` de cada rodada de tutoria (`kb:fingerprint` | `kb:causa` |
+`kb:metrica` | `modelo` — a badge "base local"
 do mock é hardcoded, `renderTutor`), `protected`/`self` calculados por
 `processctl` em vez de flag no JSON, e o `--dismiss` da tabela acima.
 

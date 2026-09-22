@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 # Garante que a saida fique na ordem certa mesmo quando redirecionada
-# (pipe/arquivo), intercalada com output de subprocessos como "claude"
+# (pipe/arquivo), intercalada com output de subprocessos como "wevtutil"
 # chamados sem capture.
 sys.stdout.reconfigure(line_buffering=True)
 

@@ -14,9 +14,12 @@ HELP_EPILOG = r"""
 REQUISITOS
     Python 3.10+
     psutil (pip install psutil) — unica dependencia de runtime; le as
-    metricas localmente. O Sentinel nao faz rede por conta propria.
-    Claude Code ("claude -p") OPCIONAL: so melhora os tutoriais de
-    correcao. Sem ele, o Sentinel usa a base offline (kb).
+    metricas localmente.
+    Motor de modelo local OPCIONAL (Ollama, ou qualquer endpoint
+    OpenAI-compativel em loopback): so melhora os tutoriais de correcao.
+    Sem motor, o Sentinel usa a base curada (.sentinel/kb.db) e diz de onde
+    veio. Ele nao instala nem baixa nada — quem prove o motor e voce;
+    `sentinel model status` diz o que encontrou.
 
 COMANDOS
     start                Inicia o daemon de vigilancia em background
@@ -34,7 +37,14 @@ COMANDOS
     fix [ID]             Ciclo de tutoria sobre uma anomalia (padrao: a
                          mais recente aberta). Gera ate 3 solucoes, vo
                          valida cada uma; se nao resolveu, passa pra
-                         proxima.
+                         proxima. --explain-source mostra a camada da base
+                         que respondeu.
+    kb                   Inventario da base local: tipos conhecidos, opcoes,
+                         o que foi aprendido do modelo e os desfechos que
+                         voce registrou. --json.
+    model status         Sonda o motor local: esta vivo? fala que dialeto?
+                         anuncia o modelo pedido? So leitura — nao instala,
+                         nao baixa. --json.
     kill <PID>           Encerra um processo problema com protecao de
                          lista do sistema + confirmacao. --tree inclui
                          descendentes.
@@ -42,9 +52,11 @@ COMANDOS
     config               Mostra limiares ativos e caminhos (--show-source).
 
 PRIVACIDADE
-    100% local. Nada sai da maquina, menos telemetria. A unica saida de
-    rede e 'claude -p', disparada so quando VOCE roda 'sentinel fix'; o
-    daemon nunca chama IA. Sem Claude, cai na base offline.
+    100% local, menos telemetria. A unica saida de rede e a pergunta a um
+    motor de IA nesta mesma maquina (loopback), disparada so quando VOCE
+    roda 'sentinel fix'; o daemon nunca chama IA. Um endereco que nao seja o
+    desta maquina e recusado no codigo, nao na config — sem excecao para IA
+    paga.
 
 EXEMPLOS
     python sentinel.py start
@@ -132,6 +144,19 @@ def build_parser() -> argparse.ArgumentParser:
         "kb", help="O que a base local (.sentinel/kb.db) ja sabe desta maquina."
     )
     kb_p.add_argument(
+        "--json", action="store_true", help="Saida em JSON (pra GUI e agentes)."
+    )
+
+    model_p = sub.add_parser(
+        "model",
+        help="Motor de modelo local (Ollama / endpoint OpenAI em loopback).",
+    )
+    model_sub = model_p.add_subparsers(dest="model_command")
+    model_status_p = model_sub.add_parser(
+        "status",
+        help="Sonda o motor: vivo? dialecto? modelo anunciado? (nao instala nada)",
+    )
+    model_status_p.add_argument(
         "--json", action="store_true", help="Saida em JSON (pra GUI e agentes)."
     )
 
@@ -430,6 +455,43 @@ def cmd_kb(paths: settings.Paths, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_model(paths: settings.Paths, args: argparse.Namespace) -> int:
+    """`sentinel model status`: o que ha do outro lado do endereco do motor.
+
+    So sonda. Este projeto nao instala runtime, nao baixa modelo e nao abre
+    excecao pra IA paga — entao o maximo que o comando pode fazer e dizer o
+    que encontrou, e o que o Sentinel faz sem motor (que e: nada muda, a base
+    curada responde).
+    """
+    if args.model_command != "status":
+        print("Uso: sentinel model status [--json]")
+        return 1
+
+    from sentinel import local_model
+
+    report = local_model.probe(overrides=settings.load_overrides(paths))
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False))
+        return 0
+
+    print(f"Motor local: {report['base']}")
+    print(f"Modelo pedido: {report['model']}")
+    if report["transport"] is None:
+        print(f"  estado: indisponivel — {report['reason']}")
+    else:
+        version = f" (versao {report['version']})" if report["version"] else ""
+        print(f"  estado: vivo, dialeto {report['transport']}{version}")
+        present = {True: "anunciado", False: "NAO anunciado", None: "sem como confirmar"}
+        print(f"  modelo: {present[report['model_present']]}"
+              + (f" — {report['reason']}" if report["reason"] else ""))
+    if report["usable"]:
+        print("  efeito: `sentinel fix` pode chamar o motor (camada 4 da base).")
+    else:
+        print("  efeito: os tutoriais saem da base curada (.sentinel/kb.db).")
+        print("  Isso e estado normal, nao erro: o Sentinel nao instala nem baixa nada.")
+    return 0
+
+
 def cmd_kill(paths: settings.Paths, args: argparse.Namespace) -> int:
     from sentinel.processctl import ProcessCtl
     from sentinel.system.prompt import is_interactive
@@ -510,6 +572,7 @@ _COMMANDS = {
     "events": cmd_events,
     "fix": cmd_fix,
     "kb": cmd_kb,
+    "model": cmd_model,
     "kill": cmd_kill,
     "prune": cmd_prune,
     "config": cmd_config,

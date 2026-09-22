@@ -152,6 +152,52 @@ DEDUPE_WINDOW_S = 300
 MAX_FIX_OPTIONS = 3
 
 # --------------------------------------------------------------------------
+# Motor de modelo local (Ollama / servidor OpenAI-compativel)
+# --------------------------------------------------------------------------
+# O Sentinel nao instala nem baixa nada: quem prove o motor e o usuario (ou
+# o Genesis). Estes valores so dizem ONDE perguntar. A ausencia do motor e
+# um estado normal — a base curada (`kb`) responde sozinha.
+#
+# Ordem de resolucao: variavel de ambiente > `.sentinel/config.json` >
+# padrao aqui.
+OLLAMA_HOST_ENV = "SENTINEL_OLLAMA_HOST"
+OLLAMA_MODEL_ENV = "SENTINEL_OLLAMA_MODEL"
+
+# Endereco padrao do Ollama na maquina. Nao e "o" endereco: qualquer host de
+# loopback serve, e o servidor OpenAI-compativel do LM Studio / llama.cpp
+# usa a mesma porta por convencao.
+DEFAULT_MODEL_BASE = "http://127.0.0.1:11434"
+
+# Nome do modelo servido. Aqui nao ha download nem tag de registry: e o id
+# que o motor local anuncia (`ollama list` / `GET /v1/models`). O peso que
+# se pretende usar e o Qwen3-Coder-Next em GGUF Q2_K — a quantizacao e uma
+# propriedade do arquivo que o usuario carregou, nao uma escolha deste
+# cliente, por isso nao aparece no nome.
+DEFAULT_MODEL_NAME = "qwen3-coder-next"
+
+# Invariante de privacidade, aplicada no codigo e nao na config: um
+# `SENTINEL_OLLAMA_HOST` apontando pra outra maquina e recusado, com ou sem
+# env var que o peca. O Sentinel fala com um motor na propria maquina — o
+# dia que ele puder falar com um remoto, "nada sai da maquina" deixa de ser
+# verdade e a frase no README passa a ser mentira.
+MODEL_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+# Tempode espera do `generate`: um Q2_K em CPU escreve devagar, e um timeout
+# curto de mais faz o motor parecer ausente quando ele so esta trabalhando.
+MODEL_TIMEOUT_S = 60.0
+
+# A sonda de `sentinel model status` tem que responder na hora: ela roda em
+# terminal, as vezes com o motor desligado, e nao ha nada a esperar.
+MODEL_PROBE_TIMEOUT_S = 2.0
+
+# Saida maxima e temperatura. Um tutorial de 3 opcoes assertivas passa facil
+# de 600 tokens; cortar no meio perde o `proof` da ultima opcao, que e a
+# parte que diz se funcionou. Temperatura baixa porque a saida e estrutural
+# (JSON), nao criativa.
+MODEL_MAX_TOKENS = 1400
+MODEL_TEMPERATURE = 0.2
+
+# --------------------------------------------------------------------------
 # Processo / servico (processctl)
 # --------------------------------------------------------------------------
 # Quantos "mais caros" listar como suspeitos num evento / em `status`.

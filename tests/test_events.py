@@ -95,7 +95,7 @@ def test_resolution_links_and_closes(tmp_path):
         ref=event["id"],
         outcome=OUTCOME_FIXED,
         option_index=0,
-        source="claude",
+        source="modelo",
         note="ok",
     )
 
