@@ -2,8 +2,8 @@
 <#
     Casca nativa da interface do Sentinel: uma janela sem moldura do WinForms
     hospedando um WebView2 apontado em gui/sentinel/index.html. Todo o visual
-    mora em gui/sentinel/ (HTML/CSS/JS); este arquivo so cuida da janela, da
-    elevacao e da ponte JS <-> PowerShell.
+    mora em gui/sentinel/ (HTML/CSS/JS); este arquivo so cuida da janela, do
+    alcance e da ponte JS <-> PowerShell.
 
     FASE 1 (hoje): a interface renderiza dados de exemplo
     (gui/sentinel/mock.js) para aprovar visual e fluxo antes de tocar no
@@ -30,7 +30,7 @@
                    payload: <...> }
 #>
 
-param([switch]$SkipElevationCheck)
+param()
 
 $ErrorActionPreference = 'Stop'
 
@@ -121,29 +121,18 @@ else {
 $indexPath = Join-Path $Root 'gui\sentinel\index.html'
 $iconPath = Join-Path $Root 'gui\Sentinel.ico'
 
-# Elevacao: o Sentinel ve processos de todo mundo e encerra com seguranca
-# apenas quando pode. Sem admin a janela sobe mesmo assim (ler as proprias
-# metricas nao exige), mas avisa — o motor e que recusa o resto.
+# Elevacao: nao existe. O Sentinel roda inteiro como usuario comum — sem
+# prompt, sem `-Verb RunAs`, sem "reiniciar como administrador" (secao 5 do
+# spec do residente, decisao de 2026-09-22). A deteccao continua aqui porque
+# ela alimenta a declaracao de alcance: o que a escada nao alcanca sem admin
+# e dito como limite, nao como convite. Dos ~338 processos da maquina, 143
+# sao inalcanaveis sem admin, e a medicao mostra o preco quase nulo disso:
+# 86 sao svchost e o resto e interno do kernel ou helper de servico — todos
+# na lista protegida, que a escada ja recusa tocar. O gap real e app alheio
+# rodado como administrador, e a resposta a ele e a frase acima.
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($identity)
 $script:IsAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $script:IsAdmin -and -not $SkipElevationCheck) {
-    $answer = [System.Windows.Forms.MessageBox]::Show(
-        "O Sentinel funciona sem administrador, mas ai nao enxerga processos " +
-        "de outros usuarios nem consegue encerrar servico. Reabrir como " +
-        "administrador?`n`nEscolha Nao para continuar em modo limitado.",
-        'Sentinel', 'YesNo', 'Question')
-    if ($answer -eq [System.Windows.Forms.DialogResult]::Yes) {
-        if ($script:IsScript) {
-            Start-Process -FilePath 'powershell.exe' -Verb RunAs -ArgumentList @(
-                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"", '-SkipElevationCheck')
-        }
-        else {
-            Start-Process -FilePath $exeFullPath -Verb RunAs -ArgumentList @('-SkipElevationCheck')
-        }
-        exit
-    }
-}
 
 # --- drag nativo + cantos arredondados (Windows 11) --------------------------
 Add-Type @'

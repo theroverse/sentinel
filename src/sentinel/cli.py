@@ -22,8 +22,11 @@ COMANDOS
     start                Inicia o daemon de vigilancia em background
                          (pidfile em .sentinel/daemon.pid).
     stop                 Encerra o daemon.
-    status               Diz se o daemon esta vivo, a ultima amostra e
-                         quantos eventos estao abertos.
+    status               Diz se o daemon esta vivo, a ultima amostra, se a
+                         vigilancia esta pausada e quantos eventos abertos.
+    pause / resume       Kill-switch sem GUI: para/retoma o registro de
+                         anomalias gravando/apagando .sentinel/paused. Vale
+                         mesmo com o daemon morto (sobrevive a reboot).
     watch                Roda o loop de vigilancia em PRIMEIRO PLANO
                          (Ctrl+C para). Util pra debug; --once = 1 tick.
     events               Lista anomalias registradas. --open-only,
@@ -89,6 +92,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("start", help="Inicia o daemon em background.")
     sub.add_parser("stop", help="Encerra o daemon.")
     sub.add_parser("status", help="Estado do daemon + resumo.")
+
+    sub.add_parser(
+        "pause",
+        help="Pausa o registro de anomalias (kill-switch em .sentinel/paused).",
+    )
+    sub.add_parser("resume", help="Retoma o que o 'pause' pausou.")
 
     watch_p = sub.add_parser("watch", help="Roda a vigilancia em 1o plano.")
     watch_p.add_argument(
@@ -194,11 +203,52 @@ def cmd_status(paths: settings.Paths, args: argparse.Namespace) -> int:
         else:
             print("Daemon: parado")
 
+    _print_pause_state(paths, st.paused)
+
     store = _store(paths)
     opens = store.open_anomalies()
     print(f"Eventos abertos: {len(opens)}")
     for finding in opens[-5:]:
         print(f"  - {_event_line(finding)}")
+    return 0
+
+
+def _print_pause_state(paths: settings.Paths, paused: bool) -> None:
+    if not paused:
+        print("Vigilancia automatica: ATIVA")
+        return
+    since = daemon.paused_since(paths)
+    note = f" desde {since.isoformat()}" if since else ""
+    print(
+        f"Vigilancia automatica: PAUSADA{note} — nada novo e registrado; "
+        "retome com 'sentinel resume'"
+    )
+
+
+def cmd_pause(paths: settings.Paths, args: argparse.Namespace) -> int:
+    daemon.pause(paths)
+    st = daemon.status(paths)
+    if st.running:
+        print(
+            f"Vigilancia pausada (daemon pid {st.pid} segue amostrando; para de "
+            "registrar anomalias no proximo batimento)."
+        )
+    else:
+        print(
+            "Vigilancia pausada. O daemon nao esta rodando agora — quando "
+            "subir, ja sobe pausado (e assim que sobrevive a reboot)."
+        )
+    print(f"Arquivo: {paths.paused}")
+    return 0
+
+
+def cmd_resume(paths: settings.Paths, args: argparse.Namespace) -> int:
+    if not daemon.resume(paths):
+        print("Nada estava pausado.")
+        return 0
+    st = daemon.status(paths)
+    state = f"no proximo batimento (pid {st.pid})" if st.running else "quando o daemon subir"
+    print(f"Vigilancia retomada {state}.")
     return 0
 
 
@@ -454,6 +504,8 @@ _COMMANDS = {
     "start": cmd_start,
     "stop": cmd_stop,
     "status": cmd_status,
+    "pause": cmd_pause,
+    "resume": cmd_resume,
     "watch": cmd_watch,
     "events": cmd_events,
     "fix": cmd_fix,

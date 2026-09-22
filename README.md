@@ -78,6 +78,8 @@ python sentinel.py fix                # tutorial guiado da mais recente
                                       # (pergunta à base local antes de qualquer modelo)
 python sentinel.py kb                 # o que a base já aprendeu
 python sentinel.py kill <PID>         # encerra um processo-problema (seguro)
+python sentinel.py pause              # para de registrar (kill-switch)
+python sentinel.py resume             # retoma
 python sentinel.py stop               # encerra o daemon
 ```
 
@@ -99,6 +101,20 @@ anomalia aberta  ──►  PROPOSE  (pergunta à base local; só depois o model
 Cada decisão é humana (tty). Sem tty — ex.: rodando por um agente de IA —
 o Sentinel apenas **exibe** as opções e sai, sem travar esperando tecla e
 sem marcar nada como resolvido.
+
+### Pausar sem interface: `sentinel pause`
+
+O interruptor é um arquivo: enquanto `.sentinel/paused` existir, o daemon
+**amostra, emite batimento e não registra nada**. Ele é lido a cada ciclo,
+então vale também para o daemon que já está rodando, sobrevive a reboot e não
+depende de janela aberta — que é o requisito de um kill-switch.
+
+Pausar é **mudo, não fila**: o que aconteceu durante a pausa não volta no
+`resume`. Um processo que nasceu e morreu entre dois batimentos só existe
+como diferença *aquele* par de batimentos, e o detector continua acumulando
+para que a sustentação esteja certa no primeiro tick livre. Cada virada
+aparece no `daemon.log` (`VIGILANCIA PAUSADO` / `VIGILANCIA ATIVO`) para o
+histórico nunca ter um buraco sem explicação.
 
 ## Como funciona
 
@@ -207,7 +223,8 @@ uma frase de marketing — e é por isso que o comando existe.
 | Comando | O que faz |
 | --- | --- |
 | `start` / `stop` | Liga/desliga o daemon de vigilância (pidfile em `.sentinel/daemon.pid`). |
-| `status` | Diz se o daemon está vivo, o último batimento e quantas anomalias estão abertas. |
+| `status` | Diz se o daemon está vivo, o último batimento, se a vigilância está pausada e quantas anomalias estão abertas. |
+| `pause` / `resume` | Kill-switch sem GUI: `.sentinel/paused` existe → o daemon amostra mas não registra nada (e, a partir da fase D, não age). Sobrevive a reboot e a daemon morto. |
 | `watch [--once]` | Roda a vigilância em primeiro plano (Ctrl+C para); `--once` faz um tick. |
 | `events [--open-only] [--limit N] [--json]` | Lista anomalias. |
 | `fix [ID]` | Ciclo de tutoria sobre uma anomalia (padrão: a mais recente aberta). `--explain-source` diz qual camada respondeu e o que pesou no ranking. |

@@ -444,3 +444,32 @@ Registradas aqui porque são o que a implementação não pode reabrir sozinha.
 O que segue em aberto, e só bloqueia a fase E: a revisão das guardas do
 caminho autônomo (rate limit por hora, cooldown por app, semântica do
 crachá) antes de qualquer degrau irreversível ligar.
+
+### 13.1 Reescopo registrado (2026-09-22, depois da fase B)
+
+Palavra do usuário, na ordem em que chegou. Nada aqui é invenção de
+implementação; é o escopo sendo corrigido por quem manda na máquina.
+
+1. **A bandeja e o toast (seção 6) saem do caminho.** "Você pode parar de
+   mexer na bandeja? Parece que tá dando trabalho, pula essa parte." O
+   kill-switch continua existindo — ele nunca dependeu da bandeja para
+   funcionar, e essa era justamente a exigência da seção 5: `.sentinel/paused`
+   gravado por `sentinel pause`, lido pelo daemon a cada ciclo, sobrevivendo a
+   reboot e a daemon morto. `SentinelTray.ps1` não é escrito agora; se um dia
+   voltar, é a mesma interface de arquivo + CLI, sem nada novo no daemon.
+2. **O provisionamento do motor (seção 10) sai do Sentinel.** "O runtime eu
+   cuido, você só precisa se comunicar com ele quando necessário." Cai o
+   `sentinel model setup` (sonda/instala/puxa); o Ollama pode continuar
+   compartilhado com a Athena, mas a instalação e o `pull` não são mais
+   responsabilidade nem superfície de código do Sentinel.
+3. **O modelo é o que o usuário escolher** — `qwen3-coder-next` em GGUF,
+   quantização `Q2_K` — e não o `llama3.2` da seção 10. Nome e host ficam em
+   `SENTINEL_OLLAMA_MODEL` / `SENTINEL_OLLAMA_HOST`, com o invariante de
+   privacidade intacto: host fora de loopback é recusado no código.
+4. **Consequência boa e deliberada:** sem o `claude -p` no caminho, a política
+   "só local" deixa de ter a única exceção que ela tinha. O Sentinel passa a
+   não ter nenhuma saída de rede em nenhum modo — inclusive no `fix`.
+5. **Motor ausente continua estado normal**, como já dizia a seção 10: a base
+   curada responde e o `fix --explain-source` diz de onde veio. A diferença é
+   que agora "ausente" é a situação desta máquina até o usuário ligar o dele.
+

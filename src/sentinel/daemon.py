@@ -27,6 +27,7 @@ class DaemonStatus:
     running: bool
     pid: int | None = None
     last_heartbeat: datetime.datetime | None = None
+    paused: bool = False
 
 
 def _read_pid(paths: settings.Paths) -> int | None:
@@ -76,18 +77,22 @@ def os_signal(pid: int, sig: int) -> None:
 
 
 def status(paths: settings.Paths) -> DaemonStatus:
+    # A pausa e lida mesmo com o daemon morto: ela mora num arquivo, nao na
+    # cabeca do processo, entao sobrevive a reboot e a um `start` novo (que e
+    # justamente o ponto — pausar sem GUI nao pode depender do daemon viver).
+    paused = is_paused(paths)
     pid = _read_pid(paths)
     if pid is None:
-        return DaemonStatus(running=False)
+        return DaemonStatus(running=False, paused=paused)
 
     if not pid_alive(pid):
         # pidfile obsoleto (crash/machine reboot): trata como nao rodando,
         # mas NAO apaga sozinho — quem apaga e `start`/`stop`, pra evitar
         # corrida entre dois processos lendo isso.
-        return DaemonStatus(running=False, pid=pid)
+        return DaemonStatus(running=False, pid=pid, paused=paused)
 
     heartbeat = _read_heartbeat(paths)
-    return DaemonStatus(running=True, pid=pid, last_heartbeat=heartbeat)
+    return DaemonStatus(running=True, pid=pid, last_heartbeat=heartbeat, paused=paused)
 
 
 def _read_heartbeat(paths: settings.Paths) -> datetime.datetime | None:
@@ -194,6 +199,56 @@ def _entry_script() -> Path:
 # ----------------------------------------------------------------------
 # Loop de vigilancia (nucleo testavel, sem subprocess)
 # ----------------------------------------------------------------------
+def is_paused(paths: settings.Paths) -> bool:
+    """Existe `.sentinel/paused`? Só a existência manda; o conteúdo é
+    diagnóstico pra quem lê o log.
+
+    `OSError` conta como não-pausado porque é o estado de sempre (arquivo
+    nunca criado). O inverso — um erro qualquer virar "pausado" — desligaria
+    a vigilância inteira, silenciosamente, num disco cheio.
+    """
+    try:
+        return paths.paused.is_file()
+    except OSError:
+        return False
+
+
+def paused_since(paths: settings.Paths) -> datetime.datetime | None:
+    """Quando a pausa começou, ou None se não há pausa (ou o conteúdo não é um
+    ISO legível). O timestamp é conveniência: a pausa vale pelo arquivo."""
+    if not is_paused(paths):
+        return None
+    try:
+        text = paths.paused.read_text(encoding="utf-8-sig").strip()
+    except OSError:
+        return None
+    if not text:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text.splitlines()[0].strip())
+    except ValueError:
+        return None
+
+
+def pause(paths: settings.Paths, *, now: datetime.datetime | None = None) -> None:
+    """Grava o arquivo de pausa com o instante (UTC) em que começou."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    paths.ensure_output_dir()
+    paths.paused.write_text(_iso(now) + "\n", encoding="utf-8", newline="\n")
+
+
+def resume(paths: settings.Paths) -> bool:
+    """Apaga a pausa. Devolve True se havia alguma pausa pra apagar — assim o
+    CLI diz 'nada pausado' em vez de fingir que retomou algo."""
+    try:
+        paths.paused.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return True
+
+
 def build_incident_sources() -> list:
     """Monitores de incidente do daemon: arvore de processos + falha de app.
 
@@ -239,6 +294,13 @@ def run_watch_loop(
     vigilância completa chama `build_incident_sources()` — assim o loop
     nunca abre processo filho nem lê o Event Log por conta propria num
     contexto de teste.
+
+    Pausado (`.sentinel/paused`) e mudo, nao fila: o sensor continua
+    amostrando e os monitores continuam consumindo o proprio estado — a
+    diferenca entre um processo vivo e um morto so existe naquele par de
+    batimentos. O que aconteceu durante a pausa nao e recuperado no
+    `resume`, e o detector segue acumulando pra que a sustentacao esteja
+    certa no primeiro tick livre.
     """
     sensor = sensor or Sensor()
     store = store or EventStore(paths.events)
@@ -252,16 +314,26 @@ def run_watch_loop(
     store.path.parent.mkdir(parents=True, exist_ok=True)
 
     ticks = 0
+    # None no primeiro tick: o estado e gravado no log mesmo sem transicao,
+    # pra um buraco no historico nunca comecar sem explicacao.
+    was_paused: bool | None = None
     try:
         while True:
             sample = sensor.sample()
+            paused = is_paused(paths)
+            if paused != was_paused:
+                _log_pause(paths, sample, paused)
+                was_paused = paused
             findings = detector.observe(sample)
-            for finding in findings:
-                _persist(store, paths, finding, sample)
+            incidents: list = []
             for source in sources:
-                for incident in _observe_incidents(source, sample):
+                incidents.extend(_observe_incidents(source, sample))
+            if not paused:
+                for finding in findings:
+                    _persist(store, paths, finding, sample)
+                for incident in incidents:
                     _persist_incident(store, paths, incident, sample)
-            _heartbeat(paths, sample)
+            _heartbeat(paths, sample, paused=paused)
             if on_sample is not None:
                 on_sample(sample, findings)
             ticks += 1
@@ -270,6 +342,19 @@ def run_watch_loop(
             sleep(interval)
     except (KeyboardInterrupt, SystemExit):
         return ticks
+
+
+def _log_pause(paths: settings.Paths, sample: Sample, paused: bool) -> None:
+    """Marca a virada no log. Sem ela, um buraco no historico parece bug de
+    sensor — e a pergunta 'quando isso foi pausado?' e a primeira que se faz
+    depois."""
+    state = "PAUSADO" if paused else "ATIVO"
+    _append_daemon_line(
+        paths,
+        f"{_iso(sample.ts)} VIGILANCIA {state} "
+        f"(arquivo {settings.PAUSED_FILENAME})"
+        + ("" if not paused else " — nada novo sera registrado ate 'sentinel resume'"),
+    )
 
 
 def _observe_incidents(source, sample: Sample) -> list:
@@ -304,12 +389,16 @@ def _persist(store: EventStore, paths: settings.Paths, finding: Finding, sample:
     _append_daemon_line(paths, line)
 
 
-def _heartbeat(paths: settings.Paths, sample: Sample) -> None:
+def _heartbeat(
+    paths: settings.Paths, sample: Sample, *, paused: bool = False
+) -> None:
+    flag = " paused=1" if paused else ""
     line = (
         f"{_iso(sample.ts)} tick cpu={sample.cpu_percent:.1f} "
         f"ram={sample.ram_percent:.1f} disk={sample.disk_percent:.1f} "
         f"io={sample.io_busy_percent:.1f} "
         f"net_down_bps={sample.net_recv_bps:.0f} net_up_bps={sample.net_sent_bps:.0f}"
+        f"{flag}"
     )
     _append_daemon_line(paths, line)
 

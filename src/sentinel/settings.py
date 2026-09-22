@@ -23,6 +23,13 @@ DAEMON_PID_FILENAME = "daemon.pid"
 
 DAEMON_LOG_FILENAME = "daemon.log"
 
+# Kill-switch sem GUI: a existencia deste arquivo basta para o daemon
+# suprimir a parte autonoma (registrar anomalia, e na fase D agir). Nao e
+# config nem limiar -- e um interruptor, entao mora no disco e nao no
+# config.json, que e opcional e pode estar quebrado (nesse caso o
+# interruptor viraria enfeite).
+PAUSED_FILENAME = "paused"
+
 # Base de conhecimento local (sqlite, stdlib): o que o Sentinel ja sabe
 # sobre esta maquina e o que ja funcionou contra cada anomalia. Fica no
 # mesmo territorio `.sentinel/` e nunca sai dela.
@@ -216,6 +223,13 @@ class Paths:
     @property
     def daemon_log(self) -> Path:
         return self.output_dir / DAEMON_LOG_FILENAME
+
+    @property
+    def paused(self) -> Path:
+        """O kill-switch: enquanto este arquivo existir, o daemon nao registra
+        anomalia nova (nem, a partir da fase D, age). Uma linha com o ISO de
+        quando pausou; o conteudo e diagnostico, a existencia e o comando."""
+        return self.output_dir / PAUSED_FILENAME
 
     @property
     def config(self) -> Path:

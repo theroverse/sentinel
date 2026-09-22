@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import datetime
+
 from conftest import make_sample, proc
 
 from sentinel import daemon, settings
@@ -73,6 +75,122 @@ def test_status_reports_not_running_without_pidfile(tmp_path):
     st = daemon.status(paths)
     assert st.running is False
     assert st.pid is None
+
+
+# --------------------------------------------------------------------------
+# Kill-switch sem GUI: `.sentinel/paused`
+# --------------------------------------------------------------------------
+def test_pause_resume_roundtrip(tmp_path):
+    paths = settings.paths_for(tmp_path)
+    assert daemon.is_paused(paths) is False
+    assert daemon.resume(paths) is False, "retomar sem pausa nao pode fingir sucesso"
+
+    daemon.pause(paths, now=datetime.datetime(2026, 9, 22, 12, 0, tzinfo=datetime.timezone.utc))
+    assert daemon.is_paused(paths) is True
+    assert daemon.paused_since(paths) == datetime.datetime(
+        2026, 9, 22, 12, 0, tzinfo=datetime.timezone.utc
+    )
+
+    assert daemon.resume(paths) is True
+    assert daemon.is_paused(paths) is False
+    assert daemon.paused_since(paths) is None
+
+
+def test_paused_since_is_lenient(tmp_path):
+    """O conteudo e diagnostico; a pausa vale pela existencia do arquivo. Um
+    arquivo vazio ou escrito na mao continua pausado — so sem data."""
+    paths = settings.paths_for(tmp_path)
+    paths.ensure_output_dir()
+
+    paths.paused.write_text("", encoding="utf-8")
+    assert daemon.is_paused(paths) is True
+    assert daemon.paused_since(paths) is None
+
+    paths.paused.write_text("nao sou um iso", encoding="utf-8")
+    assert daemon.is_paused(paths) is True
+    assert daemon.paused_since(paths) is None
+
+
+def test_pause_survives_a_dead_daemon(tmp_path):
+    """O interruptor mora num arquivo, nao na cabeca do processo: e isso que
+    faz pausar sem GUI funcionar depois de um reboot."""
+    paths = settings.paths_for(tmp_path)
+    daemon.pause(paths)
+    paths.pid.write_text("999999999", encoding="utf-8")  # pidfile obsoleto
+
+    st = daemon.status(paths)
+    assert st.running is False
+    assert st.paused is True
+
+
+def test_run_watch_loop_pauses_recording_but_keeps_sampling(tmp_path):
+    paths = settings.paths_for(tmp_path)
+    store = EventStore(paths.events)
+    daemon.pause(paths)
+
+    ticks = daemon.run_watch_loop(
+        paths,
+        sensor=FakeSensor(),
+        store=store,
+        sleep=lambda _s: None,
+        stop_after=settings.MIN_SAMPLES_BEFORE_DETECT + 5,
+    )
+
+    # CPU em 99% o ciclo inteiro, e nenhuma linha de anomalia: pausado e
+    # isso. O batimento continua (com paused=1) — senao `status` nao
+    # distinguiria 'pausado' de 'morto'.
+    assert ticks == settings.MIN_SAMPLES_BEFORE_DETECT + 5
+    assert store.anomalies() == []
+    log = paths.daemon_log.read_text(encoding="utf-8")
+    assert "VIGILANCIA PAUSADO" in log
+    assert "paused=1" in log
+    assert "ANOMALIA" not in log
+
+
+def test_run_watch_loop_resumes_mid_flight(tmp_path):
+    """Retomar no meio do ciclo tem de voltar a registrar sem reiniciar o
+    daemon — e o detector continua acumulando enquanto pausado, entao a
+    anomalia que ja estava la e gravada no primeiro tick livre."""
+    paths = settings.paths_for(tmp_path)
+    store = EventStore(paths.events)
+    daemon.pause(paths)
+
+    calls = {"n": 0}
+
+    def resume_on_third_tick(_seconds):
+        calls["n"] += 1
+        if calls["n"] == 3:
+            daemon.resume(paths)
+
+    daemon.run_watch_loop(
+        paths,
+        sensor=FakeSensor(),
+        store=store,
+        sleep=resume_on_third_tick,
+        stop_after=settings.MIN_SAMPLES_BEFORE_DETECT + 5,
+    )
+
+    log = paths.daemon_log.read_text(encoding="utf-8")
+    assert calls["n"] >= 3, "o loop mal chegou ao tick da retomada"
+    assert "VIGILANCIA ATIVO" in log
+    assert log.index("VIGILANCIA PAUSADO") < log.index("VIGILANCIA ATIVO")
+    assert any(a["metric"] == "cpu" for a in store.anomalies()), \
+        "retomou e continuou mudo"
+
+
+def test_pause_transition_is_logged_once(tmp_path):
+    paths = settings.paths_for(tmp_path)
+    daemon.pause(paths)
+    daemon.run_watch_loop(
+        paths,
+        sensor=FakeSensor(cpu=5.0),
+        store=EventStore(paths.events),
+        sleep=lambda _s: None,
+        stop_after=6,
+    )
+    log = paths.daemon_log.read_text(encoding="utf-8")
+    # Seis ticks, uma linha de estado: o log nao pode virar spam do switch.
+    assert log.count("VIGILANCIA PAUSADO") == 1
 
 
 # --------------------------------------------------------------------------
