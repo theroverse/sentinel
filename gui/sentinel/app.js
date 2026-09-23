@@ -144,6 +144,7 @@ const state = {
   focus: null,    // seletor do elemento focado: o re-render nao pode roubar o teclado
   dataRoot: "",   // onde mora o .sentinel/ desta instancia (disse o host)
   dataRootFrom: "",
+  shown: true,    // a janela esta na tela? escondida na bandeja, o poll para
   hasData: false, // a primeira resposta do motor chegou? (antes dela nao ha numero a pintar)
   killed: [],
   newId: null,
@@ -1619,6 +1620,11 @@ function startPolling() {
     // interação possível nesta tela.
     if (state.kill || Object.keys(bridge.pending).length) return;
     if (document.hidden) return;
+    // Janela escondida na bandeja não é janela aberta: ali não tem ninguém
+    // olhando, e cada volta deste relógio custa um processo Python. O daemon
+    // segue gravando sozinho no território; os números se refazem quando a
+    // pessoa volta (host-state shown:true chama refresh()).
+    if (!state.shown) return;
     refresh();
   }, 5000);
 }
@@ -1652,6 +1658,14 @@ function onBridgeMessage(event) {
     }
     render();      // a casca já mostra "lendo o território…"
     refresh();     // e a primeira resposta real substitui o que estava na tela
+    return;
+  }
+  if (msg.type === "host-state") {
+    // A casca conta quando a janela foi escondida na bandeja ou voltou. É só
+    // isto: o território e os números continuam sendo do motor, e quem manda
+    // no daemon continua sendo o `sentinel stop` da linha de comando.
+    state.shown = p.shown !== false;
+    if (state.shown && state.engineAvailable) refresh();
     return;
   }
   // Tipos que esta página não conhece são ignorados: a interface continua com

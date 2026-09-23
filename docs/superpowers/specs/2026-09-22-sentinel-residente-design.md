@@ -546,6 +546,20 @@ implementação; é o escopo sendo corrigido por quem manda na máquina.
    que agora não há mais um `setup` prometido atrás do vazio — a ausência é o
    fim da linha, e o `model status` é quem a declara.
 
+6. **2026-09-22, depois da fase 3 (exe): a bandeja volta, mas embutida.**
+   Palavra do usuário: "quando eu fecho ele nao vai pro tray, e ele fica uns
+   segundos travados". O que saiu do caminho no item 1 continua fora — não há
+   `gui/SentinelTray.ps1`, não há processo extra, não há toast de anomalia e
+   não há menu "ver últimas anomalias". O que entra é só o que faltava para o
+   verbo "fechar" significar o que o residente promete: `NotifyIcon` dentro do
+   próprio `SentinelHost.ps1`, com "Abrir console" e "Sair do Sentinel".
+   Fechar a janela é esconder; o daemon nunca dependeu da janela para vigiar,
+   e agora existe caminho de volta. O item 1 da seção 6 (pausar ações pelo
+   menu) continua não entregue: `sentinel pause` e a tela de ajustes já fazem
+   isso, e o kill-switch por arquivo foi desenhado justamente para não
+   depender de interface nenhuma.
+
 Itens 2, 3 e 4 foram entregues junto com `local_model.py` (fase F da tabela
-acima); o item 1 permanece entregue só na parte do kill-switch.
+acima); o item 1 permanece entregue só na parte do kill-switch, e o item 6 é
+a correção dessa mesma parte no console.
 

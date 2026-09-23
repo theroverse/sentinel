@@ -24,7 +24,7 @@
       JS -> PS : { type: 'ready' | 'window-close' | 'window-minimize'
                          | 'window-drag' | 'engine-call',
                    payload: <o que o handler precisa> }
-      PS -> JS : { type: 'host-ready' | 'engine-reply'
+      PS -> JS : { type: 'host-ready' | 'host-state' | 'engine-reply'
                          | 'not-implemented' | 'bridge-error',
                    payload: <...> }
 
@@ -33,6 +33,16 @@
       JSON do CLI como TEXTO, nao re-serializado. O `request_id` volta igual
       porque a pagina faz varias chamadas em voo e precisa saber a qual cada
       resposta pertence.
+
+      `window-close` NAO encerra o app: esconde a janela para a bandeja e a
+      vigia continua (e o que se espera de um residente). `host-state`
+      { shown } acompanha cada ida e volta, porque enquanto a janela esta
+      escondida a pagina nao tem porque pagar um Python a cada 5 s.
+
+    A UI thread nunca espera o filho Python: o pedido entra numa fila e um
+    runspace de trabalho roda o processo; a resposta volta por outra fila, que
+    um timer do WinForms drena. Ver "engine worker" abaixo — foi assim que o
+    travamento de 1-2 s ao clicar sumiu.
 #>
 
 param()
@@ -222,6 +232,118 @@ $webView.CreationProperties = $creationProps
 $form.Controls.Add($webView)
 $form.Add_Shown({ [NativeDrag]::RoundCorners($form.Handle) })
 
+# ------------------------------------------------------------------- bandeja --
+<#
+    Fechar a janela nao fecha o Sentinel: a janela esconde e a vigia continua
+    no icone da bandeja. Sair de verdade e o "Sair do Sentinel" do menu do
+    icone. Nada aqui e um processo a mais — bandeja e janela sao o mesmo
+    processo, ao contrario do SentinelTray.ps1 independente, que saiu do
+    escopo (spec do residente, secao 13.1).
+
+    O daemon ja vivia sozinho (processo Python propio, desligado da janela); o
+    que faltava era o caminho de volta, e e isso que a bandeja entrega.
+
+    Duas redes de seguranca, ambas aprendidas no Genesis:
+      1. NotifyIcon.Visible pode falhar SEM lancar nada (.NET Framework lanca
+         Win32Exception, mas o caminho de falha silenciosa ja foi visto aqui);
+      2. janela escondida sem icone e janela perdida — some da barra de
+         tarefas e nao ha para onde clicar.
+    Por isso Hide-ToTray so esconde depois de o icone responder que esta la;
+    se nao responder, fechar volta a significar fechar.
+#>
+$script:Exiting = $false
+$script:Shown = $true
+$script:TrayHintShown = $false
+
+$script:trayIcon = New-Object System.Windows.Forms.NotifyIcon
+# Instancia PROPRIA de Icon, nao $form.Icon: compartilhar o mesmo handle GDI+
+# entre a janela e o NotifyIcon e causa conhecida de Shell_NotifyIcon falhar
+# calado — nenhuma excecao, o icone so nunca aparece.
+$script:trayIconIcon = $null
+try {
+    if (Test-Path $iconPath) { $script:trayIconIcon = New-Object System.Drawing.Icon($iconPath) }
+} catch { }
+if (-not $script:trayIconIcon) { $script:trayIconIcon = [System.Drawing.SystemIcons]::Application }
+$script:trayIcon.Icon = $script:trayIconIcon
+$script:trayIcon.Text = 'Sentinel - vigiando'
+$script:trayIcon.Visible = $false
+
+function Show-FromTray {
+    $script:Shown = $true
+    $script:trayIcon.Visible = $false
+    $form.Show()
+    if ($form.WindowState -eq 'Minimized') { $form.WindowState = 'Normal' }
+    $form.Activate()
+    Tell-Window-Shown
+}
+
+$trayMenu = New-Object System.Windows.Forms.ContextMenuStrip
+$trayMenuOpen = New-Object System.Windows.Forms.ToolStripMenuItem('Abrir console')
+$trayMenuOpen.Add_Click({ Show-FromTray })
+$trayMenuQuit = New-Object System.Windows.Forms.ToolStripMenuItem('Sair do Sentinel')
+$trayMenuQuit.Add_Click({ Stop-Sentinel })
+[void]$trayMenu.Items.Add($trayMenuOpen)
+[void]$trayMenu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+[void]$trayMenu.Items.Add($trayMenuQuit)
+$script:trayIcon.ContextMenuStrip = $trayMenu
+
+# Clique esquerdo e duplo restauram a janela. O direito nem passa por aqui: o
+# ContextMenuStrip abre sozinho, entao quem nao tem o habito de duplo-clique
+# continua com o menu.
+$script:trayIcon.Add_Click({ Show-FromTray })
+$script:trayIcon.Add_DoubleClick({ Show-FromTray })
+
+function Tell-Window-Shown {
+    # A pagina para de pollar escondida (see startPolling in app.js): janela
+    # fechada nao precisa pagar um Python a cada 5 segundos.
+    Send-ToJs -Type 'host-state' -Payload @{ shown = [bool]$script:Shown }
+}
+
+function Hide-ToTray {
+    <#
+        Devolve $true quando a janela esta escondida e a bandeja a segura.
+        $false e o caso que nao se pode fingir que deu certo: sem icone nao ha
+        para onde esconder, e ai fechar e fechar mesmo.
+    #>
+    if ($script:Shown -eq $false) { return $true }
+    try { $script:trayIcon.Visible = $true } catch { }
+    if (-not $script:trayIcon.Visible) { return $false }
+    $script:Shown = $false
+    $form.Hide()
+    if (-not $script:TrayHintShown) {
+        # Uma vez so, e exatamente na hora em que a pessoa aprende o gesto:
+        # 'escondido' nao e 'morto', e a seta ^ do Windows esconde icones.
+        $script:TrayHintShown = $true
+        try {
+            $script:trayIcon.ShowBalloonTip(5000, 'Sentinel continua vigiando',
+                'A janela esta escondida na bandeja. Clique no icone para abrir de novo; "Sair do Sentinel" e que encerra esta interface.',
+                [System.Windows.Forms.ToolTipIcon]::Info)
+        } catch { }
+    }
+    Tell-Window-Shown
+    return $true
+}
+
+function Stop-Sentinel {
+    # A unica saida real desta janela. O daemon nao vai junto: ele vigia
+    # sozinho, e o que faz do Sentinel um residente.
+    $script:Exiting = $true
+    $form.Close()
+}
+
+# Alt+F4 e qualquer $form.Close() passam TODOS por aqui — o X da titlebar
+# customizada manda 'window-close', que cai no mesmo Hide-ToTray. Um unico
+# ponto de decisao para "fechar quer dizer o que".
+$form.Add_FormClosing({
+    param($s, $e)
+    if ($script:Exiting) { return }
+    if (Hide-ToTray) { $e.Cancel = $true } else { $script:Exiting = $true }
+})
+$form.Add_FormClosed({
+    $script:trayIcon.Visible = $false
+    $script:trayIcon.Dispose()
+})
+
 # ------------------------------------------------------------------ bridge --
 # Cast para [array]: o ConvertTo-Json do Windows PowerShell 5.1 transforma um
 # array puro em {"value":[...],"Count":N} quando ele chega como propriedade
@@ -232,6 +354,10 @@ function Send-ToJs {
         $Payload -isnot [System.Collections.IDictionary]) {
         $Payload = [array]$Payload
     }
+    # Antes de o CoreWebView2 existir nao ha para quem falar: um Alt+F4 na
+    # janela de inicializacao passa por aqui (Hide-ToTray) e nao pode virar
+    # excecao em cima de um controle que ainda nao tem nucleo.
+    if (-not $webView.CoreWebView2) { return }
     $msg = @{ type = $Type; payload = $Payload } | ConvertTo-Json -Depth 8 -Compress
     $webView.CoreWebView2.PostWebMessageAsJson($msg)
 }
@@ -278,14 +404,22 @@ $EngineTimeoutMs = 15000
     ProcessStartInfo com CreateNoWindow, e `WindowStyle Hidden` junto porque o
     `py.exe` da Microsoft lanca o interpretador de verdade como NETO, e o neto
     herda o SHOWWINDOW do avo, nunca o CREATE_NO_WINDOW.
+
+    A fonte desta funcao vive num TEXTO e nao direto no arquivo porque o mesmo
+    codigo precisa rodar em dois lugares: na UI thread (a pergunta `py -3` do
+    startup) e no runspace de trabalho (o poll de cada 5 s), e um runspace novo
+    nao herda funcao nenhuma de quem o criou. Uma definicao, dois destinos:
+    copiar o CreateNoWindow para la seria o jeito exato de deixar uma das duas
+    copias desatualizada e a janela de terminal voltar.
 #>
+$EngineSpawnSource = @'
 function Invoke-EngineProcess {
-    param([string]$Exe, [string]$Arguments)
+    param([string]$Exe, [string]$Arguments, [string]$WorkDir, [int]$TimeoutMs)
 
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
     $psi.Arguments = $Arguments
-    $psi.WorkingDirectory = $Root
+    $psi.WorkingDirectory = $WorkDir
     # Sem UseShellExecute=false o redirect e o CreateNoWindow sao ignorados em
     # silencio, e e exatamente ai que a janela volta a aparecer.
     $psi.UseShellExecute = $false
@@ -308,9 +442,9 @@ function Invoke-EngineProcess {
         # sempre num processo que ja morreu.
         $outTask = $proc.StandardOutput.ReadToEndAsync()
         $errTask = $proc.StandardError.ReadToEndAsync()
-        if (-not $proc.WaitForExit($EngineTimeoutMs)) {
+        if (-not $proc.WaitForExit($TimeoutMs)) {
             try { $proc.Kill() } catch { }
-            throw "o motor nao respondeu em $([math]::Round($EngineTimeoutMs/1000)) s."
+            throw "o motor nao respondeu em $([math]::Round($TimeoutMs/1000)) s."
         }
         [void]$proc.WaitForExit()
         return [pscustomobject]@{
@@ -323,6 +457,8 @@ function Invoke-EngineProcess {
         $proc.Dispose()
     }
 }
+'@
+. ([ScriptBlock]::Create($EngineSpawnSource))
 
 function Resolve-EnginePython {
     foreach ($c in @(
@@ -336,7 +472,8 @@ function Resolve-EnginePython {
         if ($c.Prefix.Count) {
             try {
                 $probe = Invoke-EngineProcess -Exe $c.Exe `
-                    -Arguments '-3 -c "import sys; print(sys.executable)"'
+                    -Arguments '-3 -c "import sys; print(sys.executable)"' `
+                    -WorkDir $Root -TimeoutMs $EngineTimeoutMs
                 $real = ($probe.Text -split "`r?`n" | Where-Object { $_.Trim() } |
                     Select-Object -Last 1).Trim()
                 if ($real -and (Test-Path -LiteralPath $real)) {
@@ -385,32 +522,138 @@ function Engine-Available {
     return [bool]($script:EnginePython -and (Test-Path $EngineCli))
 }
 
-function Invoke-EngineCli {
+function Engine-ArgString {
     <#
-        Roda `python sentinel.py --dir <territorio> <args...>` e devolve o
-        stdout como texto. Codigo de saida != 0 NAO e falha do bridge: um
-        `kill` recusado responde JSON com ok:false, e a verdade daquela
-        recusa mora no Python.
+        A linha de comando do motor: `python sentinel.py --dir <territorio>
+        <args...>`, com aspas onde o caminho tem espaco. So texto, nenhum
+        processo — por isso fica na UI thread junto da traducao do pedido.
     #>
     param([string[]]$Words)
 
-    if (-not (Engine-Available)) {
-        if ($script:EnginePython) { throw "nao encontrei o entry-point do motor em $EngineCli" }
-        throw 'Python nao esta no PATH (py -3 / python / python3).'
-    }
-
     $py = $script:EnginePython
     $argList = @($py.Prefix) + @($EngineCli, '--dir', $script:DataRoot.Root) + $Words
-    $argString = ($argList | ForEach-Object {
+    return ($argList | ForEach-Object {
         if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
     }) -join ' '
+}
 
-    $r = Invoke-EngineProcess -Exe $py.Exe -Arguments $argString
-    if (-not $r.Text) {
-        if ($r.Err) { throw ($r.Err -split "`r?`n" | Select-Object -Last 1) }
-        throw "o motor nao respondeu nada ($($Words[0]), codigo $($r.Code))."
+# ------------------------------------------------------------- engine worker --
+<#
+    Porque existe uma fila: `metrics` leva de 0,6 a 2 s no disco. Rodando na UI
+    thread, como rodava, a janela para de responder durante esse tempo — e o
+    clique em "fechar" fica pendurado atras do filho que comecou 0,1 s antes.
+    E isso que aparecia como "uns segundos travado".
+
+    Agora o pedido entra em $EngineRequests, um runspace roda o processo la
+    fora, e a resposta sai por $EngineReplies para a UI thread drenar no passo
+    do timer. Nenhuma decisao muda de lado: o que vale continua sendo o JSON
+    que o Python escreveu, e o worker nao interpreta nada — so transporta.
+
+    Codigo de saida != 0 NAO e falha da ponte: um `kill` recusado responde JSON
+    com ok:false, e a verdade daquela recusa mora no Python.
+#>
+$EngineRequests = New-Object System.Collections.Concurrent.ConcurrentQueue[object]
+$EngineReplies = New-Object System.Collections.Concurrent.ConcurrentQueue[object]
+$script:EngineWorker = $null
+
+$EngineWorkerSource = @'
+param($Cfg)
+. ([ScriptBlock]::Create($Cfg.SpawnSource))
+
+while ($true) {
+    $job = $null
+    if (-not $Cfg.Requests.TryDequeue([ref]$job)) { Start-Sleep -Milliseconds 30; continue }
+    if ($job.Exit) { return }
+    try {
+        $r = Invoke-EngineProcess -Exe $Cfg.Py -Arguments $job.Args `
+            -WorkDir $Cfg.Root -TimeoutMs $Cfg.TimeoutMs
+        $Cfg.Replies.Enqueue([pscustomobject]@{
+            Id = $job.Id; Cmd = $job.Cmd; Text = $r.Text; Err = $r.Err; Code = $r.Code
+        })
     }
-    return $r.Text
+    catch {
+        $Cfg.Replies.Enqueue([pscustomobject]@{
+            Id = $job.Id; Cmd = $job.Cmd; Error = $_.Exception.Message
+        })
+    }
+}
+'@
+
+function Start-EngineWorker {
+    param([switch]$Force)
+    if ($script:EngineWorker) { return }
+    if (-not $Force -and -not (Engine-Available)) { return }
+
+    $cfg = @{
+        SpawnSource = $EngineSpawnSource
+        Requests    = $EngineRequests
+        Replies     = $EngineReplies
+        Py          = $script:EnginePython.Exe
+        Root        = $Root
+        TimeoutMs   = $EngineTimeoutMs
+    }
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $ps = [PowerShell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($EngineWorkerSource).AddArgument($cfg)
+    # BeginInvoke e o que POE o worker para andar: sem esta linha o objeto
+    # existe, o runspace esta aberto, a fila aceita pedidos e nunca chega
+    # resposta nenhuma — e a janela fica muda em perfeito silencio.
+    $script:EngineWorker = @{ Runspace = $rs; PS = $ps; Async = $ps.BeginInvoke() }
+}
+
+function Stop-EngineWorker {
+    if (-not $script:EngineWorker) { return }
+    try { [void]$script:EngineRequests.Enqueue(@{ Exit = $true }) } catch { }
+    # Pede para parar e NAO espera: o filho em voo pode estar no meio de um
+    # `kill` que a pessoa acabou de confirmar, e o processo ja esta morrendo
+    # mesmo — a thread do runspace e de fundo e vai junto.
+    try { $script:EngineWorker.PS.BeginStop($null, $null) } catch { }
+    $script:EngineWorker = $null
+}
+
+function Request-Engine {
+    param([string]$Cmd, [string[]]$Words, $RequestId)
+
+    if (-not $script:EngineWorker) {
+        Send-EngineReply -Cmd $Cmd -RequestId $RequestId `
+            -Error 'nao ha motor rodando nesta janela (sem Python no PATH ou entry-point ausente).'
+        return
+    }
+    [void]$script:EngineRequests.Enqueue(@{
+        Id   = $RequestId
+        Cmd  = $Cmd
+        Args = (Engine-ArgString -Words $Words)
+    })
+}
+
+function Pump-EngineReplies {
+    <#
+        Drena o que o worker respondeu, na UI thread, e manda para a pagina.
+        Roda no tick do timer: uma passada por resposta pendurada, e sai quando
+        a fila esvazia — nunca fica segurando a janela.
+    #>
+    $job = $null
+    while ($script:EngineReplies.TryDequeue([ref]$job)) {
+        if ($job.Error) {
+            Send-EngineReply -Cmd $job.Cmd -RequestId $job.Id -Error $job.Error
+            continue
+        }
+        if (-not $job.Text) {
+            $why = if ($job.Err) { ($job.Err -split "`r?`n" | Select-Object -Last 1) }
+                   else { "o motor nao respondeu nada ($($job.Cmd), codigo $($job.Code))." }
+            Send-EngineReply -Cmd $job.Cmd -RequestId $job.Id -Error $why
+            continue
+        }
+        $text = $job.Text
+        if ($EngineJsonlCommands -contains $job.Cmd) {
+            # `events --json` e JSONL (uma linha por evento, do jeito que os
+            # agentes ja leem): vira array aqui, sem tocar no conteudo.
+            $text = '[' + ((($text -split "`r?`n") | Where-Object { $_.Trim() }) -join ',') + ']'
+        }
+        Send-EngineReply -Cmd $job.Cmd -RequestId $job.Id -ValueJson $text
+    }
 }
 
 # Resposta de maquina em texto cru: `value` ja e JSON valido (veio do Python),
@@ -509,7 +752,9 @@ function Handle-Message {
             }
         }
         'window-close' {
-            $form.Close()
+            # Fechar = escondido na bandeja, com a vigia continuando. So vira
+            # saida de verdade se o icone nao aparecer (ver Hide-ToTray).
+            if (-not (Hide-ToTray)) { Stop-Sentinel }
         }
         'window-minimize' { $form.WindowState = 'Minimized' }
         'window-drag' {
@@ -524,11 +769,11 @@ function Handle-Message {
                 return
             }
             try {
-                $json = Invoke-EngineCli -Words (Engine-Args -Cmd $cmd -P $Msg.payload)
-                if ($EngineJsonlCommands -contains $cmd) {
-                    $json = '[' + ((($json -split "`r?`n") | Where-Object { $_.Trim() }) -join ',') + ']'
-                }
-                Send-EngineReply -Cmd $cmd -RequestId $reqId -ValueJson $json
+                # A traducao do pedido e imediata (e pura mentoria de
+                # parametro); o processo Python vai para a fila e a resposta
+                # volta pelo Pump-EngineReplies, no tick do timer.
+                Request-Engine -Cmd $cmd -RequestId $reqId `
+                    -Words (Engine-Args -Cmd $cmd -P $Msg.payload)
             }
             catch {
                 Send-EngineReply -Cmd $cmd -RequestId $reqId -Error $_.Exception.Message
@@ -555,7 +800,10 @@ $webView.add_CoreWebView2InitializationCompleted({
             "WebView2 nao inicializou: $($e.InitializationException.Message)`n`nO Runtime do WebView2 (vem com o Windows 11) pode estar faltando."
         }
         [System.Windows.Forms.MessageBox]::Show($msg, 'Sentinel', 'OK', 'Error')
-        $form.Close()
+        # Stop-Sentinel, nao $form.Close(): sem o aviso de saida o FormClosing
+        # ia cancelar o fechamento e esconder na bandeja uma janela que nao tem
+        # interface nenhuma — um icone sem console seria para sempre.
+        Stop-Sentinel
         return
     }
     $webView.CoreWebView2.add_WebMessageReceived({
@@ -574,6 +822,31 @@ $webView.add_CoreWebView2InitializationCompleted({
         }
     })
 })
+# O worker e o relogio de respostas comecam aqui, e nao no topo do arquivo:
+# o runspace precisa de $Root/$EngineCli/$script:EnginePython de pe, e o timer
+# so tem onde pingar quando a bomba de mensagens da janela existir.
+Start-EngineWorker
+
+# 40 ms: invisivel ao lado dos ~700 ms que um filho Python leva, e nao acorda
+# a UI thread mais vezes do que o preciso. Se uma resposta nao chegar (motor
+# morto no meio do caminho), o tick nao bloqueia nada — so nao tem o que
+# drenar.
+$script:EnginePump = New-Object System.Windows.Forms.Timer
+$script:EnginePump.Interval = 40
+$script:EnginePump.Add_Tick({
+    try { Pump-EngineReplies }
+    catch {
+        # Chegar aqui e quase sempre "a janela ja fechou e nao tem para quem
+        # responder". Parar o relogio e o unico final honesto.
+        $script:EnginePump.Stop()
+    }
+})
+$script:EnginePump.Start()
+$form.Add_FormClosed({
+    $script:EnginePump.Stop()
+    Stop-EngineWorker
+})
+
 $webView.Source = [Uri]::new($indexPath)
 
 [void]$form.ShowDialog()
