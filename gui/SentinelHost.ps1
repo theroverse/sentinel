@@ -268,12 +268,83 @@ $AllowedEngineCommands = @(
 # ocupado sem deixar a janela pendurada para sempre.
 $EngineTimeoutMs = 15000
 
+<#
+    Um filho Python sem janela de console, nem por um instante.
+
+    `Start-Process -NoNewWindow` nao bastou: este exe e compilado com
+    `-noConsole` do ps2exe, entao o pai NAO tem console nenhum para o filho
+    herdar, e o Windows aloca um novo a cada chamada — uma janela de terminal
+    piscando no ritmo do poll (5 s). O caminho deterministico e o
+    ProcessStartInfo com CreateNoWindow, e `WindowStyle Hidden` junto porque o
+    `py.exe` da Microsoft lanca o interpretador de verdade como NETO, e o neto
+    herda o SHOWWINDOW do avo, nunca o CREATE_NO_WINDOW.
+#>
+function Invoke-EngineProcess {
+    param([string]$Exe, [string]$Arguments)
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $Exe
+    $psi.Arguments = $Arguments
+    $psi.WorkingDirectory = $Root
+    # Sem UseShellExecute=false o redirect e o CreateNoWindow sao ignorados em
+    # silencio, e e exatamente ai que a janela volta a aparecer.
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    # UTF-8 dos dois lados: sem isto, no Windows o filho escreve acento em
+    # cp1252 na pipe e a pagina recebe '?' no lugar do portugues.
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+    $psi.EnvironmentVariables['PYTHONIOENCODING'] = 'utf-8'
+
+    $proc = New-Object System.Diagnostics.Process
+    $proc.StartInfo = $psi
+    [void]$proc.Start()
+    try {
+        # Os dois canis leidos em tarefa, nunca um atras do outro: a pipe enche
+        # em ~4 KB, e um traceback longo travaria a leitura do stdout para
+        # sempre num processo que ja morreu.
+        $outTask = $proc.StandardOutput.ReadToEndAsync()
+        $errTask = $proc.StandardError.ReadToEndAsync()
+        if (-not $proc.WaitForExit($EngineTimeoutMs)) {
+            try { $proc.Kill() } catch { }
+            throw "o motor nao respondeu em $([math]::Round($EngineTimeoutMs/1000)) s."
+        }
+        [void]$proc.WaitForExit()
+        return [pscustomobject]@{
+            Text = ([string]$outTask.Result).Trim()
+            Err  = ([string]$errTask.Result).Trim()
+            Code = $proc.ExitCode
+        }
+    }
+    finally {
+        $proc.Dispose()
+    }
+}
+
 function Resolve-EnginePython {
     foreach ($c in @(
         @{ Exe = 'py';      Prefix = @('-3') },
         @{ Exe = 'python';  Prefix = @() },
         @{ Exe = 'python3'; Prefix = @() })) {
-        if (Get-Command $c.Exe -ErrorAction SilentlyContinue) { return $c }
+        if (-not (Get-Command $c.Exe -ErrorAction SilentlyContinue)) { continue }
+        # `py -3` e um lancador, nao o interpretador: cada chamada dele cria DOIS
+        # processos. Uma pergunta no startup troca o lancador pelo python real, e
+        # o poll deixa de passar pelo lancador para sempre.
+        if ($c.Prefix.Count) {
+            try {
+                $probe = Invoke-EngineProcess -Exe $c.Exe `
+                    -Arguments '-3 -c "import sys; print(sys.executable)"'
+                $real = ($probe.Text -split "`r?`n" | Where-Object { $_.Trim() } |
+                    Select-Object -Last 1).Trim()
+                if ($real -and (Test-Path -LiteralPath $real)) {
+                    return @{ Exe = $real; Prefix = @() }
+                }
+            } catch { }   # sem resposta vale o lancador mesmo: ele funciona
+        }
+        return $c
     }
     return $null
 }
@@ -334,41 +405,12 @@ function Invoke-EngineCli {
         if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
     }) -join ' '
 
-    # UTF-8 forcado nos dois lados: sem isto, no Windows o filho escreve acento
-    # em cp1252 na pipe e a pagina recebe `?` no lugar do portugues.
-    [Environment]::SetEnvironmentVariable('PYTHONIOENCODING', 'utf-8', 'Process')
-
-    $tmp = Join-Path $env:TEMP ('sentinel-bridge-' + [guid]::NewGuid().ToString('N'))
-    $outFile = "$tmp.out.txt"
-    $errFile = "$tmp.err.txt"
-    try {
-        $proc = Start-Process -FilePath $py.Exe -ArgumentList $argString `
-            -WorkingDirectory $Root -NoNewWindow -PassThru `
-            -RedirectStandardOutput $outFile -RedirectStandardError $errFile
-        if (-not $proc.WaitForExit($EngineTimeoutMs)) {
-            try { $proc.Kill() } catch { }
-            throw "o motor nao respondeu em $([math]::Round($EngineTimeoutMs/1000)) s ($($Words[0]))."
-        }
-        $text = ''
-        if (Test-Path $outFile) {
-            # ReadAllText + UTF8 explicito: Get-Content do 5.1 chuta a codificacao
-            # pelo BOM, e sem BOM ele le cp1252 e quebra o acento.
-            $text = [System.IO.File]::ReadAllText($outFile, [System.Text.Encoding]::UTF8)
-        }
-        $err = ''
-        if (Test-Path $errFile) {
-            $err = [System.IO.File]::ReadAllText($errFile, [System.Text.Encoding]::UTF8)
-        }
-        $text = $text.Trim()
-        if (-not $text) {
-            if ($err) { throw ($err.Trim() -split "`r?`n" | Select-Object -Last 1) }
-            throw "o motor nao respondeu nada ($($Words[0]), codigo $($proc.ExitCode))."
-        }
-        return $text
+    $r = Invoke-EngineProcess -Exe $py.Exe -Arguments $argString
+    if (-not $r.Text) {
+        if ($r.Err) { throw ($r.Err -split "`r?`n" | Select-Object -Last 1) }
+        throw "o motor nao respondeu nada ($($Words[0]), codigo $($r.Code))."
     }
-    finally {
-        Remove-Item $outFile, $errFile -Force -ErrorAction SilentlyContinue
-    }
+    return $r.Text
 }
 
 # Resposta de maquina em texto cru: `value` ja e JSON valido (veio do Python),
