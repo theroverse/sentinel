@@ -174,7 +174,8 @@ Verified by execution:
 - Mock data was re-checked against the engine, and three fictions were
   corrected: `daemon.log` has no `heartbeat`/`daemon iniciado`/`resolucao`
   lines (only `tick` and `ANOMALIA`, with `thr=` not `threshold=`); a
-  resolution's `source` is `claude`|`kb`, never `user`; an exhausted tutor
+  resolution's `source` is one of `kb:fingerprint`|`kb:causa`|`kb:metrica`|
+  `modelo`, never `user`; an exhausted tutor
   cycle closes the event as `dismissed` with `outcome=not_fixed`, it does
   not leave it in `addressing`. `isProtectedName()` now mirrors
   `processctl.is_protected` name-for-name (the invented

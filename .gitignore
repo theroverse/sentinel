@@ -14,6 +14,7 @@ htmlcov/
 
 # Saida do proprio Sentinel quando rodado dentro deste repo em testes
 .sentinel/
+dist/
 
 # Editor / OS
 .vscode/

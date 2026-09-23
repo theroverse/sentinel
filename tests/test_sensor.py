@@ -78,3 +78,50 @@ def test_top_processes_excludes_system_idle():
     sensor = Sensor(psutil_module=_ps(processes=procs))
     names = [p.name for p in sensor.top_processes(sort="cpu", n=5)]
     assert names == ["realhog"]
+
+
+# -- paginacao: percentual + taxa ------------------------------------------
+
+
+def test_swap_percent_comes_straight_from_the_counter():
+    """Diferente da taxa, o percentual nao precisa de janela anterior: no
+    Windows ele E a carga de commit, e um numero valido na primeira leitura
+    (o indice de estagnacao comeca a us-lo no tick 1)."""
+    sensor = Sensor(psutil_module=_ps(swap=(91.5, 0, 0)))
+    assert sensor.sample(top=False).swap_percent == 91.5
+
+
+def test_swap_rate_is_zero_on_first_sample_then_delta():
+    ps = _ps(swap=(10.0, 1000, 500))
+    sensor = Sensor(psutil_module=ps)
+    assert sensor.sample(top=False).swap_activity_ps == 0.0
+
+    now = sensor._prev_swap[0]
+    sensor._prev_swap = (now - 100.0, 1500)
+    ps._swap = (10.0, 4000, 1500)
+    assert sensor.sample(top=False).swap_activity_ps == pytest.approx(40.0, rel=0.01)
+
+
+def test_swap_counter_reset_is_not_negative_traffic():
+    """sin/sout voltam a zero quando o SO reinicia: um delta negativo nao e
+    trafego ao contrario, e 0.0 (sem sinal)."""
+    ps = _ps(swap=(10.0, 9000, 9000))
+    sensor = Sensor(psutil_module=ps)
+    sensor.sample(top=False)
+    now = sensor._prev_swap[0]
+    sensor._prev_swap = (now - 10.0, 18000.0)
+    ps._swap = (10.0, 5, 5)
+    assert sensor.sample(top=False).swap_activity_ps == 0.0
+
+
+def test_machine_without_swap_measures_zero_and_keeps_sampling():
+    """Ausencia de medida nao e estagnacao: o sensor continua entregando o
+    resto. Maquina Linux sem swap e o caso real."""
+
+    class NoSwap(FakePsutil):
+        swap_memory = None  # psutil raises here; o sensor trata como 0
+
+    sensor = Sensor(psutil_module=NoSwap(cpu=33.0))
+    sample = sensor.sample(top=False)
+    assert (sample.swap_percent, sample.swap_activity_ps) == (0.0, 0.0)
+    assert sample.cpu_percent == 33.0

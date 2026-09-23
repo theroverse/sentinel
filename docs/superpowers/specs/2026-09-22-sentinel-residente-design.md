@@ -83,6 +83,22 @@ Regras do índice:
 - Todo sinal entra no evento, para o tutorial poder citar *o que* foi
   medido em vez de dizer "o sistema está lento".
 
+Estado (2026-09-22, D1): os três sinais de gargalo e o culpado em crítico
+sustentado estão implementados em `sentinel/stall.py`, medidos a cada ciclo
+do daemon, com o intervalo encurtado sob suspeita. A **janela pendurada** não
+está: ela abre a sugestão e não o degrau (regra acima), e enumerar janelas por
+PID é o único sinal da tabela que exige ctypes — entra junto de quem a consome
+na fase D2, não antes. A auto-inanição é medida sobre o `sleep()` e não sobre o
+ciclo inteiro, porque dentro do ciclo moram o scan de processos e a consulta ao
+Event Log — trabalho nosso, não fome da máquina.
+
+Medida nesta máquina, e ela muda a leitura do sinal: no Windows o psutil
+devolve `sin`/`sout` **zerados** (a própria documentação diz que ali eles não
+significam nada). Ou seja, `thrashing` é carregado pelo percentual de carga de
+commit, que no Windows é o `swap_memory().percent`; a taxa só conta em Linux. É
+por isso que o tutorial de `stall` cita a carga medida e nunca uma taxa que,
+aqui, seria "0".
+
 ## 5. Escada de ação, e quem autoriza o quê
 
 A decisão não passa pela GUI porque, no cenário que você descreveu, a GUI
@@ -119,6 +135,48 @@ Guardas do caminho autônomo:
 - Toda intervenção autônoma gera linha no `daemon.log`, evento próprio no
   `events.jsonl` e uma resolução automática do tipo `action=...` — o
   histórico é auditável, que é o que permite confiar no degrau 3 depois.
+
+### O que a D2 entregou (2026-09-22)
+
+Deste ponto em diante esta seção descreve o que existe, não o que foi pedido.
+
+- **degrau 1 ligado no loop**: `relief.ReliefAgent` é consultado a cada
+  batimento por `run_watch_loop(..., relief=)`, com o culpado do índice e o
+  estado do episódio (`episode_open`, `suspect`) na mão. Quem não passa por
+  ele é o `watch --once`, desligado de propósito: um tick de diagnóstico não
+  pode correr na frente do daemon nem brigar pelo mesmo pid.
+- **só prioridade, por enquanto**: `ACTION_LOWER` / `ACTION_RESTORE` usam a
+  classe de prioridade do psutil (`BELOW_NORMAL_PRIORITY_CLASS`, lida por
+  `getattr` — nunca número inventado), com queda para `nice` em POSIX.
+  afinidade e teto de I-O continuam teoria: sem evidência medida de que
+  precisam, virar alavanca seria alcance sem motivo.
+- **reversão em três caminhos**: fim do episódio, `shut_down()` no `finally`
+  do loop, e `recover()` no primeiro tick de um daemon novo. O diário
+  `.sentinel/relief.json` guarda pid, nome, `create_time` e os dois valores
+  crus; pid reciclado **não** é devolvido — a identidade confere ou a ação não
+  acontece.
+- **guardas**: teto de `RELIEF_HOUR_LIMIT` (3) decisões/hora e cooldown de
+  `RELIEF_APP_COOLDOWN_S` (600 s) por **nome**. Contam decisões, não toques
+  bem-sucedidos (também as do modo sombra); o boost do próprio daemon não
+  conta, porque contar contra si mesmo desligaria o degrau justo na hora em
+  que ele serve. `paused` não consulta o agente.
+- **modo sombra**: `orders.json` (`{"schema":1,"shadow":bool}`), lido de novo
+  a cada decisão, reescalado por `sentinel orders shadow --on|--off`. A linha
+  do evento não usa a palavra `would_act`: ela carrega `shadow: true` +
+  `applied: false` e um `label` com verbo explícito (`FEZ` / `SERIA` / `NAO
+  FEZ`), porque um campo booleano separado é o que a GUI e o `events
+  --interventions` conseguem filtrar sem parser de texto.
+- **o que mudou do texto acima**: não há "resolução automática" `action=...`.
+  Intervenção é um `kind` próprio (`intervention`), **nunca deduplicado** e
+  nunca fechado sozinho: aplicar marca a anomalia do episódio como
+  `addressing`, e quem diz `resolved` continua sendo o usuário no ciclo do
+  `fix`. Misturar as duas coisas no `kind: "resolution"` faria o Sentinel
+  validar a própria ação.
+- **sem elevação, confirmado em código**: `AccessDenied` termina em
+  `sem-alcance` registrado; não há `runas`, não há serviço, não há segunda
+  tentativa.
+- **fora do que foi entregue**: degraus 2 e 3, ordem permanente por app,
+  qualquer UI (a chave vive no CLI e no `orders.json` até a GUI).
 
 ### Alcance sem elevação
 
@@ -288,19 +346,42 @@ preenche na leitura com o número daquele evento (seção 8). Uma opção do
 catálogo que não tem como preencher o seu token é um buraco visível — e há
 teste pra isso, não revisão de volante.
 
-## 10. Motor local, compartilhado com a Athena
+## 10. Motor local (estado atual: implementado; provisionamento fora de escopo)
 
-Não é um segundo Ollama. É **um servidor para os dois** — a Athena já tem o
-único cliente Ollama do monorepo (`athena/src/athena/summarizer/ollama_client.py`:
-`/api/generate`, `/api/chat`, `/api/embeddings`, sonda `GET /api/tags`,
-stdlib `urllib`) e o modelo padrão dela é `llama3.2`. O Sentinel usa o mesmo
-servidor, a mesma porta e **o mesmo modelo**: puxar um modelo diferente pra
-economizar um prompt seria gastar 2 GB de disco alheio à toa.
+> Reescrito em 2026-09-22 depois da entrega. Esta seção descrevia um motor
+> compartilhado com a Athena e um `sentinel model setup` que instala e puxa
+> modelo. O reescopo da seção 13.1 tirou o provisionamento do Sentinel — "o
+> runtime eu cuido, você só precisa se comunicar com ele quando necessário"
+> — e trocou o modelo. O que está aqui embaixo é o código que existe.
 
-Forma do código: cópia própria (~120 linhas), não import da Athena. O
-monorepo já é assim por decisão (`system/process.py` existe quatro vezes);
-importar `athena.settings` criaria acoplamento entre satélites que não se
-conhecem. A cópia traz três diferenças deliberadas:
+Não é um segundo Ollama nem um segundo nada: é **um cliente**. A Athena tem
+o seu (`athena/src/athena/summarizer/ollama_client.py`), e os dois continuam
+sendo cópias próprias por decisão do monorepo (`system/process.py` existia
+quatro vezes) — importar o `settings` de um satélite no outro criaria
+acoplamento entre ferramentas que não se conhecem.
+
+Forma do que foi escrito (`src/sentinel/local_model.py`):
+
+- Transporte: Ollama `POST http://127.0.0.1:11434/api/generate`
+  (`stream: false`) e, se aquele servidor não tem a rota (404/405), um
+  endpoint OpenAI-compatível (`/v1/chat/completions`) — LM Studio e
+  llama.cpp server na mesma porta de loopback.
+- **Invariante de privacidade reforçada**: host fora de `127.0.0.1`/`::1`/
+  `localhost` é recusado **no código**, não na config — vale para a env var e
+  para o `config.json`. Timeout curto na sonda, um timeout só na geração.
+- Recusa de conexão **não** dobra a espera: se o host está morto, o segundo
+  dialeto está no mesmo host morto, e tentar os dois é só fazer o usuário
+  esperar duas vezes.
+- Duas funções públicas: `complete(prompt)` → texto ou `None`, e
+  `probe()` → diagnóstico. As costuras `post`/`get` são injetáveis, então a
+  suíte inteira roda sem abrir socket.
+- Ausência do motor é estado normal: o `fix` roda a camada 3 (base curada) e
+  diz `source=kb:metrica`. `sentinel model status [--json]` é a única
+  superfície disso na CLI — sonda, não instala, não baixa, não escreve.
+- Modelo padrão: **`qwen3-coder-next`** (`SENTINEL_OLLAMA_MODEL` para trocar;
+  ver seção 13.1). A quantização `Q2_K` é propriedade do arquivo GGUF que o
+  usuário carregou, não uma escolha deste cliente, por isso não aparece no
+  nome.
 
 | | Athena hoje | Sentinel |
 |---|---|---|
@@ -308,106 +389,93 @@ conhecem. A cópia traz três diferenças deliberadas:
 | host remoto | aceita o que a env mandar | **recusa fora de loopback, no código** |
 | Ollama ausente | cai em `claude -p` no modo `auto` | **não cai**: a base curada responde e diz de onde veio |
 
-`local_model.py` substitui `claude_client.py` no caminho crítico:
+`claude_client.py` foi apagado com a mudança. Se `claude -p` ficar em algum
+lugar do Theroverse, é fora do Sentinel: aqui a política local não tem mais
+exceção nenhuma.
 
-- Transporte: Ollama `POST http://127.0.0.1:11434/api/generate`
-  (`stream: false`), e um transporte OpenAI-compatível
-  (`/v1/chat/completions`) para LM Studio/llama.cpp server.
-- **Invariante de privacidade reforçada**: host fora de `127.0.0.1`/`::1`/
-  `localhost` é recusado no código, não na config. Timeout curto. Sem
-  telemetria, sem chamada de descoberta.
-- Ausência do motor é estado normal: o `fix` roda na base curada e diz de
-  onde veio. Nada na interface finge que há IA.
-- `claude -p` sai do caminho do Sentinel. Se ficar, é opt-in explícito e
-  rotulado como saída de rede — o que hoje é a única exceção à política
-  local e deixa de ser.
-- Modelo padrão: **`llama3.2`** (o da Athena). O trabalho é formatar até 3
-  opções com `why`, não raciocinar sobre o disco.
+### Provisionamento: tirado do escopo, registrado pra quem o fizer
 
-### Provisionamento: instalar e puxar só o que falta
+Medição desta máquina (2026-09-22): `where ollama` vazio e
+`127.0.0.1:11434` recusando conexão — **não há motor instalado**. Ainda assim
+o Sentinel não instala nada: a decisão da seção 13.1 é que o runtime é de
+quem o usa, e o `fix` sem motor responde da base curada. O que sobrou aqui é
+o caminho que **outro** projeto (o Genesis, preparador de máquina) pode
+percorrer, com as evidências já medidas:
 
-Medição desta máquina (2026-09-22): `where ollama` vazio e `127.0.0.1:11434`
-recusando conexão — **o Ollama não está instalado**, então hoje o
-`--backend auto` da Athena cai em `claude -p`. E ninguém instala hoje: o
-Genesis, que é o preparador de máquina, não tem uma linha sobre Ollama.
-
-`sentinel model setup` faz o ciclo, idempotente, na ordem:
-
-1. **Sonda** `GET /api/version` no loopback → se responde, nada a instalar.
-2. **Instala se faltar**: `winget install -e --id Ollama.Ollama --silent
+1. Sondar `GET /api/version` no loopback → se responde, nada a instalar.
+2. Instalar se faltar: `winget install -e --id Ollama.Ollama --silent
    --accept-package-agreements --accept-source-agreements`. Verificado no
    manifest: v0.34.2, instaladora **Inno** (`OllamaSetup.exe`) em escopo de
    usuário (`%LOCALAPPDATA%\Programs\Ollama`) — **sem UAC**, o que mantém de
    pé a decisão "sem elevação" da seção 5.
-3. **Garante o servidor**: se instalado mas mudo, `ollama serve` em segundo
-   plano; o Sentinel não compete pelo controle do serviço com a GUI do
-   Ollama, só espera a porta responder.
-4. **Puxa o modelo só se não existir**: `ollama list` → se `llama3.2` não
-   estiver lá, `ollama pull llama3.2`. É download grande (~2 GB): pede
-   confirmação explícita, mostra o tamanho e fala a origem
-   (`ollama.com`/GitHub), porque é o único instante em que o Sentinel toca a
-   rede por um motivo que não é o usuário mandando.
-5. **Relata** o que encontrou pronto e o que fez — `already installed,
-   model present` é uma resposta tão boa quanto `installed`.
+3. Garantir o servidor, sem competir com a GUI do Ollama: só esperar a porta
+   responder.
+4. Puxar o peso só se não existir — e um `pull` é download grande, pede
+   confirmação explícita e diz a origem. O primeiro uso do Ollama 0.34
+   pergunta *"sign in or continue locally"*: o fluxo não-interativo tem que
+   cair em **local**.
+5. Relatar o que achou pronto: `already installed, model present` é uma
+   resposta tão boa quanto `installed`.
 
-Guardas, e elas importam mais que o conforto:
-
-- **Nada disso roda no daemon.** O provisionamento é comando de terminal,
-  disparado por você (ou pela bandeja, que só reexecuta o `sentinel model
-  setup` já escrito). Um processo residente que baixa 2 GB sozinho é
-  exatamente a traição de confiança que este projeto evita.
-- A nota de versão do Ollama 0.34 avisa de um primeiro uso com escolha
-  *"sign in or continue locally"*: o fluxo sem interação tem que cair em
-  **local**, e o Sentinel não abre a GUI de conta em nome de ninguém.
-- Instalação não é pré-requisito de vigilância: sem Ollama, o Sentinel segue
-  100% funcional na base curada (`kb`), e o `fix --explain-source` mostra
-  que veio de lá.
-
-Segundo passo, fora do escopo do Sentinel mas registrado aqui: o Genesis
-deveria ganhar `Install-Ollama.ps1` com o mesmo padrão idempotente que ele
-já usa para o Claude Code (`Test-CommandExists` → instala). Se só o Sentinel
-souber provisionar, uma máquina nova precisa abrir o Sentinel para entregar
-o backend que a Athena usa.
+O que o Sentinel entrega no lugar é o diagnóstico, não a instalação:
+`sentinel model status [--json]` — dialeto, versão e se o modelo pedido está
+anunciado. Um vigilante que baixa gigabytes sozinho é exatamente a traição de
+confiança que este projeto evita; e instalação nunca foi pré-requisito de
+vigilância.
 
 ## 11. Impacto no que já existe
 
-- **CLI**: `sentinel tray`, `sentinel orders list|grant|revoke|shadow`,
-  `sentinel pause|resume`, `sentinel kb stats`, `sentinel model status|setup`
-  (sonda, instalação, `pull` — seção 10), flags `--json` da fase 0 da spec da
-  GUI, `sentinel relief <pid> [--restore]`.
+- **CLI**: entregue — `pause` / `resume`, `kb [--json]`, `model status
+  [--json]`, `fix --explain-source`, `relief <pid> [--restore]`, `orders
+  [shadow --on|--off]`, `events --interventions`. Pendente — `orders
+  list|grant|revoke` por app (fase E) e os `--json` da fase 0 da spec da GUI.
+  Fora de escopo — `sentinel tray` (a bandeja saiu, seção 13.1) e `sentinel
+  model setup` (o provisionamento saiu, seção 10).
 - **daemon**: árvore por ciclo, índice de stall, executor de degraus,
   leitura do `paused`, prioridade própria alta. Roda como usuário comum.
+  Estado: `paused` lido (fase C), índice de stall medindo com intervalo
+  próprio encurtado sob suspeita (D1), e o **degrau 1 executando** com
+  guardas, diário, reversão e auto-boost de prioridade (D2). Os degraus 2 e 3
+  continuam sem executor: exigem ordem por app.
 - **`SentinelHost.ps1`**: o prompt `YesNo` de reabrir como administrador
   (linhas 130–146) sai. Fica a detecção de `IsAdmin`, só que reorientada:
   ela alimenta a declaração de alcance da seção 5, não um convite à
   elevação. A bandeja (`SentinelTray.ps1`) nasce sem qualquer
   `-Verb RunAs`.
-- **events**: tipos novos (`app_failure`, `orphan_tree`, `relief_applied`),
-  schema 2. A linha de incidente **não** tem `value`/`threshold`: tem
-  `label` (uma frase, pro log e pro CLI) e `detail` (o mapa da árvore, ou o
-  módulo + código de exceção da queda). Nem uma nem outra se disfarçam de
-  limiar com zero preenchido.
+- **events**: tipos novos de métrica (`app_failure`, `orphan_tree`, `stall`),
+  schema 2, e um `kind` novo: `intervention`. A linha de incidente **não** tem
+  `value`/`threshold`: tem `label` (uma frase, pro log e pro CLI) e
+  `detail` (o mapa da árvore, o módulo + código de exceção da queda, ou os
+  números medidos pelo índice de stall). Nem uma nem outra se disfarçam de
+  limiar com zero preenchido. A de intervenção carrega `action`, `reason`,
+  `shadow`, `applied`, `ref` e os dois valores crus de prioridade — e não é
+  deduplicada: caderno de conduta não se resume em `occurrences`.
 - **daemon.log**: linha `ANOMALIA <metric> <sev> occ=N status=... id=... ::
   <label>` — o `:: <label>` no fim mantém os pares `chave=valor`
-  interpretáveis e ainda dá de ler o que aconteceu sem abrir o JSONL.
+  interpretáveis e ainda dá de ler o que aconteceu sem abrir o JSONL. O
+  degrau 1 acrescenta `ALIVIO <label> id=...`, com o verbo do resultado
+  (`FEZ` / `SERIA` / `NAO FEZ`) já dentro do `<label>`.
 - **GUI** (fase 1 já aprovada): vista "Ações automáticas" com as ordens
   permanentes, a chave de modo sombra e o histórico do que foi feito sem
   pedir; o card do tutorial passa a mostrar `why`/`prova`/`risco`; um
   processo elevado inalcançável aparece com o limite declarado, não com um
   botão morto.
 - **testes**: fake de `winreg`/ctypes para os degraus; o stall index e o
-  ranking da base são testáveis sem Windows real, como o resto já é.
+  ranking da base são testáveis sem Windows real, como o resto já é. O
+  degrau 1 é testado contra um `psutil` de mentira que expõe as classes de
+  prioridade e levanta `AccessDenied` quando o teste manda — nenhum teste
+  toca pid real, e o relógio das guardas é injetado.
 
 ## 12. Ordem de execução proposta
 
 | fase | entrega | risco |
 |---|---|---|
-| A | falha de app + órfão + schema 2 + testes | nenhum (só lê) |
-| B | `kb.db`, formato assertivo, reescrita do conteúdo, ranking | nenhum |
-| C | bandeja + toast + pause/resume | baixo |
-| D | stall index + degrau 1 **já ligado** + guardas (rate limit, cooldown, `paused`) + chave de modo sombra | médio |
+| A | ✔ falha de app + órfão + schema 2 + testes | nenhum (só lê) |
+| B | ✔ `kb.db`, formato assertivo, reescrita do conteúdo, ranking | nenhum |
+| C | ✔ pause/resume em arquivo (a bandeja e o toast saíram — 13.1) | baixo |
+| D | **entregue** (2026-09-22). *D1 — medir:* índice de stall no daemon (auto-inanição, thrash e disco saturado, combinados com culpado em crítico sustentado); evento próprio `stall` com os números medidos; intervalo encurtado 2,0 s → 0,5 s sob suspeita; `swap_percent`/`swap_activity_ps` na `Sample` e no batimento; catálogo curado da métrica (3 opções, nenhuma com `action`) com a prova montada só com o que o episódio mediu, e o `culprit` como assinatura de causa na camada 2 da base. *D2 — agir:* `relief.py` rebaixa o culpado nomeado (classe de prioridade, `nice` onde não há classe), com guardas (`RELIEF_HOUR_LIMIT` 3/h, cooldown 600 s por nome, `paused` mudo, protegidos e auto-recusa, `AccessDenied` declarado e não furado), diário `.sentinel/relief.json` com `create_time` pra provar identidade, reversão em três caminhos (fim do episódio, `finally` do loop, `recover()` do daemon novo), boost do próprio daemon rebaixado, `orders.json` + `sentinel orders shadow --on\|--off` (decide e grava `SERIA` sem tocar), evento `kind: intervention` nunca deduplicado apontando `ref` pro episódio, `sentinel relief <pid> [--restore]` e `events --interventions`. Degraus 2 e 3 seguem sem executor: fase E, com a sua revisão | médio |
 | E | degraus 2 e 3, ordens permanentes por crachá, teto por job | **alto — precisa da sua revisão das guardas** |
-| F | `local_model.py` + `sentinel model setup` (sonda/instala/puxa) + vistas novas da GUI | médio (rede + instalação de terceiro, ambas sob confirmação) |
+| F | ✔ `local_model.py` (sonda + dois dialetos, veto de loopback) e `model status`; o `setup` saiu (13.1). Restam as vistas novas da GUI | baixo (nenhuma instalação, nenhuma inferência no daemon) |
 
 Cada fase fecha com pytest verde e o detector do impeccable na GUI.
 
@@ -415,7 +483,9 @@ Cada fase fecha com pytest verde e o detector do impeccable na GUI.
 
 Registradas aqui porque são o que a implementação não pode reabrir sozinha.
 
-1. **Motor local: Ollama, e o Sentinel provisiona.** Não é um Ollama do
+1. **Motor local: Ollama, e o Sentinel provisiona.** *Superscrito pela
+   seção 13.1: o provisionamento saiu do Sentinel e o modelo mudou.*
+   Não é um Ollama do
    Sentinel — é o Ollama da máquina, o mesmo que a Athena usa, com o mesmo
    modelo (`llama3.2`). `sentinel model setup` instala se faltar e puxa o
    modelo se ele não estiver lá; nunca roda sozinho, nunca no daemon
@@ -423,7 +493,8 @@ Registradas aqui porque são o que a implementação não pode reabrir sozinha.
    Medições de 2026-09-22 que sustentam isso: Ollama **ausente** desta máquina
    (`where ollama` vazio, `11434` recusando), **nenhum** código no monorepo o
    instala hoje, e o instalador é Inno em escopo de usuário — cabe na regra
-   "sem elevação".
+   "sem elevação". O que sobreviveu à mudança: nenhum modelo pago, nenhuma
+   inferência externa, nada no daemon, e o veto de loopback no código.
 2. **Degrau 1 ligado desde o início, sem crachá.** Rebaixar prioridade sob
    stall é a resposta ao "aviso atrasado": funciona onde o travamento
    acontece e se desfaz sozinho. Os degraus 2 e 3 exigem crachá por app, e
@@ -444,3 +515,51 @@ Registradas aqui porque são o que a implementação não pode reabrir sozinha.
 O que segue em aberto, e só bloqueia a fase E: a revisão das guardas do
 caminho autônomo (rate limit por hora, cooldown por app, semântica do
 crachá) antes de qualquer degrau irreversível ligar.
+
+### 13.1 Reescopo registrado (2026-09-22, depois da fase B)
+
+Palavra do usuário, na ordem em que chegou. Nada aqui é invenção de
+implementação; é o escopo sendo corrigido por quem manda na máquina.
+
+1. **A bandeja e o toast (seção 6) saem do caminho.** "Você pode parar de
+   mexer na bandeja? Parece que tá dando trabalho, pula essa parte." O
+   kill-switch continua existindo — ele nunca dependeu da bandeja para
+   funcionar, e essa era justamente a exigência da seção 5: `.sentinel/paused`
+   gravado por `sentinel pause`, lido pelo daemon a cada ciclo, sobrevivendo a
+   reboot e a daemon morto. `SentinelTray.ps1` não é escrito agora; se um dia
+   voltar, é a mesma interface de arquivo + CLI, sem nada novo no daemon.
+2. **O provisionamento do motor (seção 10) sai do Sentinel.** "O runtime eu
+   cuido, você só precisa se comunicar com ele quando necessário." Cai o
+   `sentinel model setup` (sonda/instala/puxa); o Ollama pode continuar
+   compartilhado com a Athena, mas a instalação e o `pull` não são mais
+   responsabilidade nem superfície de código do Sentinel.
+3. **O modelo é o que o usuário escolher** — `qwen3-coder-next` em GGUF,
+   quantização `Q2_K` — e não o `llama3.2` da seção 10. Nome e host ficam em
+   `SENTINEL_OLLAMA_MODEL` / `SENTINEL_OLLAMA_HOST`, com o invariante de
+   privacidade intacto: host fora de loopback é recusado no código.
+4. **Consequência boa e deliberada:** sem o `claude -p` no caminho, a política
+   "só local" deixa de ter a única exceção que ela tinha. Nenhuma linha do
+   Sentinel atravessa a placa de rede: o único socket que ele abre é com a
+   própria máquina (loopback), e mesmo esse só a pedido, num `sentinel fix`.
+5. **Motor ausente continua estado normal**, como já dizia a seção 10: a base
+   curada responde e o `fix --explain-source` diz de onde veio. A diferença é
+   que agora não há mais um `setup` prometido atrás do vazio — a ausência é o
+   fim da linha, e o `model status` é quem a declara.
+
+6. **2026-09-22, depois da fase 3 (exe): a bandeja volta, mas embutida.**
+   Palavra do usuário: "quando eu fecho ele nao vai pro tray, e ele fica uns
+   segundos travados". O que saiu do caminho no item 1 continua fora — não há
+   `gui/SentinelTray.ps1`, não há processo extra, não há toast de anomalia e
+   não há menu "ver últimas anomalias". O que entra é só o que faltava para o
+   verbo "fechar" significar o que o residente promete: `NotifyIcon` dentro do
+   próprio `SentinelHost.ps1`, com "Abrir console" e "Sair do Sentinel".
+   Fechar a janela é esconder; o daemon nunca dependeu da janela para vigiar,
+   e agora existe caminho de volta. O item 1 da seção 6 (pausar ações pelo
+   menu) continua não entregue: `sentinel pause` e a tela de ajustes já fazem
+   isso, e o kill-switch por arquivo foi desenhado justamente para não
+   depender de interface nenhuma.
+
+Itens 2, 3 e 4 foram entregues junto com `local_model.py` (fase F da tabela
+acima); o item 1 permanece entregue só na parte do kill-switch, e o item 6 é
+a correção dessa mesma parte no console.
+

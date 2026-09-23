@@ -11,6 +11,12 @@ from sentinel.detector import (
     METRIC_RAM,
 )
 from sentinel.incidents import METRIC_APP_FAILURE, METRIC_ORPHAN_TREE
+from sentinel.stall import (
+    METRIC_STALL,
+    SIGNAL_DISK_SATURATED,
+    SIGNAL_STARVED,
+    SIGNAL_THRASHING,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +533,102 @@ _OPTIONS: dict[str, list[dict]] = {
             reversible=True,
         ),
     ],
+    # --- estagnacao: o atraso medido, nao o recurso alto -----------------
+    # Sem `action` em nenhuma opcao. O episodio de stall nao tem
+    # `top_processes` (schema 2), e o unicos passos que mexem no sistema aqui
+    # rodam na sua sessao, sem admin — o degrau automatico e da fase D2.
+    METRIC_STALL: [
+        _opt(
+            "Rebaixar a prioridade do {culprit} sem fechar nada",
+            [
+                "O evento mede {evidence}, com {culprit} (pid {pid}) em "
+                "critico de {culprit_metric}.",
+                "No PowerShell da sua sessao: (Get-Process -Id {pid})"
+                ".PriorityClass = 'BelowNormal'. Nao pede admin e nao "
+                "encerra nada.",
+                "Para desfazer antes de o episodio acabar, o mesmo comando "
+                "com 'Normal': (Get-Process -Id {pid}).PriorityClass = "
+                "'Normal'.",
+            ],
+            why="Prioridade nao limita quanto um processo usa: limita a "
+                "ORDEM em que ele e atendido. Em 'BelowNormal' o {culprit} "
+                "so pega nucleo e fila de disco quando nao ha nenhuma thread "
+                "sua esperando, e era exatamente isso que faltava — "
+                "{evidence}. O atraso que voce sente nao e a maquina sem "
+                "recurso, e a sua janela atras de um processo que estava na "
+                "mesma condicao que ela na fila do escalonador. Rebaixar tira "
+                "o culpado da frente sem jogar fora o trabalho que ele esta "
+                "fazendo, e por isso que isto vem antes de encerrar qualquer "
+                "coisa.",
+            proof="Clique em uma janela: a resposta volta em um ou dois "
+                "segundos, com o {culprit} ainda rodando. No batimento "
+                "seguinte o daemon nao reabre o episodio e escreve "
+                "'ESTAGNACAO CESSOU' no daemon.log.",
+            risk="A tarefa que esta em {culprit} demora mais pra acabar — "
+                "ela nao perde, so sai da frente. Reversivel no mesmo "
+                "comando, e o Windows devolve 'Normal' quando o processo "
+                "fecha.",
+            reversible=True,
+        ),
+        _opt(
+            "Devolver memoria ao paginador fechando janelas, nao processos",
+            [
+                "Veja em 'sentinel events --json' se o `detail.signals` do "
+                "episodio inclui `thrashing`: esta opcao e pra quando a "
+                "paginacao e o gargalo — sendo so disco, va pra opcao de "
+                "agendamento.",
+                "Dentro do {culprit}, feche o que nao esta em uso agora (as "
+                "abas mais antigas, os projetos abertos, a aba com audio "
+                "mudo que voce esqueceu): isso cede memoria sem perder o "
+                "processo.",
+                "Depois o residente de bandeja que voce nao esta usando, e "
+                "confira em 'sentinel status' quantos pontos a RAM cedeu. "
+                "O episodio mediu {evidence}.",
+            ],
+            why="Enquanto o working set ativo nao cabe na RAM, o Windows "
+                "mantem parte dele no arquivo de paginacao e passa o tempo "
+                "lendo aquilo de volta — e cada uma dessas leituras segura "
+                "uma operacao sua, inclusive o clique. Ceder working set e a "
+                "unica saida que nao exige reiniciar nada: o arquivo nao "
+                "diminui, mas deixa de ser lido a cada toque. Fechar janelas "
+                "antes de fechar o processo porque o {culprit} pode ser "
+                "exatamente o que voce esta usando, e o que importa e o "
+                "volume que ele segura parado.",
+            proof="O sinal de paginacao sai da proxima leitura, o episodio "
+                "fecha sozinho no log, e abrir arquivo volta a custar um "
+                "toque em vez de um segundo e meio.",
+            risk="Voce perde o estado nao salvo das janelas que fechou. "
+                "Navegador reabre a sessao; editor nao.",
+            reversible=True,
+        ),
+        _opt(
+            "Descobrir se isto se repete no mesmo relogio todo dia",
+            [
+                "Rode 'sentinel events --json --limit 20' e conte quantos "
+                "episodios de stall existem e quem e o `culprit` de cada um.",
+                "Cruze o campo `ts` com o que roda sozinho nessa hora: "
+                "agendador (taskschd.msc > Biblioteca), backup, sync de "
+                "nuvem, verificacao do antiviral.",
+                "Sendo tarefa agendada, mude o horario dela pra janela "
+                "ociosa no proprio programa — rebaixar prioridade todo dia e "
+                "tratar sintoma.",
+            ],
+            why="Um episodio isolado e carga de trabalho que voce pediu, e "
+                "rebaixar a prioridade resolve o minuto. A mesma linha no "
+                "mesmo relogio, varias vezes, e agendamento: ai nenhuma acao "
+                "pontual da conta, porque o travamento volta amanha na mesma "
+                "hora. O Sentinel ja gravou os dois casos com o mesmo "
+                "fingerprint e a contagem de occurrences crescendo, entao a "
+                "distincao sai de uma leitura local — e escolher o caminho "
+                "errado custa a tarde inteira.",
+            proof="Nos dias seguintes o episodio deixa de aparecer na hora "
+                "de uso, e o campo `occurrences` daquele fingerprint para de "
+                "crescer.",
+            risk="Nenhum: o passo so consulta o historico que ja esta no "
+                "disco da maquina.",
+            reversible=True,
+        ),
+    ],
 }
 
 
@@ -568,7 +670,51 @@ def _event_tokens(event: dict) -> dict:
         tokens["parent"] = str(detail["parent"].get("name", ""))
     if detail.get("orphan_count") is not None:
         tokens["orphan_count"] = str(detail["orphan_count"])
+    culprit = detail.get("culprit") or {}
+    if culprit.get("name"):
+        tokens["culprit"] = str(culprit["name"])
+    if culprit.get("pid") is not None and "pid" not in tokens:
+        # O evento de incidente nao tem `top_processes`: o pid citado no
+        # tutorial e o do culpado que o indice sustentou.
+        tokens["pid"] = str(culprit["pid"])
+    if culprit.get("metric"):
+        tokens["culprit_metric"] = str(culprit["metric"])
+    evidence = _stall_evidence(detail, tokens)
+    if evidence:
+        tokens["evidence"] = evidence
     return tokens
+
+
+def _stall_evidence(detail: dict, tokens: dict) -> str:
+    """A prova do episodio, em uma frase, montada so com o que foi medido.
+
+    `measured` traz numero pra tudo, inclusive zero: num Windows onde o
+    psutil devolve `sin`/`sout` zerados, citar a taxa seria escrever "0 por
+    segundo" numa frase que afirma que a maquina esta paginando. Entao cada
+    sinal contribui com a sua propria medida, e sinal sem medida utilisavel
+    fica de fora.
+    """
+    measured = detail.get("measured") or {}
+    signals = detail.get("signals") or []
+    parts: list[str] = []
+    sleep_s = measured.get("sleep_s")
+    interval_s = measured.get("interval_s")
+    if SIGNAL_STARVED in signals and sleep_s and interval_s:
+        parts.append(f"o sleep de {_num(interval_s)} s do daemon levou "
+                     f"{_num(sleep_s)} s")
+    if SIGNAL_THRASHING in signals and measured.get("swap_percent"):
+        parts.append(f"a carga de paginacao esta em "
+                     f"{_num(measured['swap_percent'])}%")
+    if SIGNAL_DISK_SATURATED in signals and measured.get("io_busy_percent"):
+        parts.append(f"o disco passou {_num(measured['io_busy_percent'])}% do "
+                     f"tempo em I/O")
+    if parts:
+        return "; ".join(parts)
+    if tokens.get("culprit"):
+        # Sem numero aproveitavel resta o unico fato que todo episodio de
+        # stall tem: um candidato sustentado em critico.
+        return f"{tokens['culprit']} ficou em critico sustentado"
+    return ""
 
 
 def _num(value) -> str:
